@@ -1,0 +1,124 @@
+\documentclass[a4paper,11pt]{ctexart}
+
+% 引入必要的宏包
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{amsmath, amssymb, amsfonts} % 数学公式支持
+\usepackage{bm} % 粗体数学符号
+\usepackage{hyperref} % 超链接支持
+\usepackage{url}
+
+% additional packages
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+
+% 页面边距设置
+\geometry{left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm}
+
+% 标题设置
+\title{\textbf{Mergenet 写作提纲}}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+transformers在建模语言方面表现卓越，但在内存和时间复杂度方面效率低下。一种可能的解决方案是缩短序列长度。（Dynamic Token Pooling，Hourglass Transformer）分词就是最有效的缩短序列长度，让模型精准理解文本内容的手段，但是当前的分词器面临着一些局限性。现有的 LLM 严重依赖静态分词器（BPE，UniGram，SentencePiece），导致了跨领域适应性差、无法处理 Out-of-Distribution (OOD) 文本，且在处理信息密度不均文本时计算效率低下（由于这些分词器基于频率而非语义，导致模型在处理“高频无意义词”和“低频高义词”时分配了同样的算力，同时 Rho-1 已经向我们证明“并非所有 Token 都重要”）。
+
+面对这样的问题，端到端学习是一种出路。端到端学习模型（MegaByte，SpaceByte，MambaByte，BLT，HNet）尝试移除分词器，但面临“硬切分”导致的语义断裂、梯度无法回传优化分词策略，以及推理时无法动态修正前期错误的局限。
+
+\textbf{Mergenet 核心创新：}提出一种全局可微的层级架构。
+\begin{itemize}
+    \item 引入 DTEM (Decoupled Token Embedding Merging) 机制，在 LoE 阶段通过可学习的度量动态聚类 Byte 序列。
+    \item 利用 Perceiver-style Cross-Attention （perciever）将聚合后的语义“概念”压缩为固定长度的 Latent Vectors，实现高压缩率。
+    \item LoD连续滑动解码结合重建损失，确保生成过程的语义对齐。
+\end{itemize}
+
+\textbf{结果预告：}在保持 byte-level 灵活性的同时，实现了与 word-level 模型相当的推理速度，并在代码/多语言等 OOV 密集场景下显著优于 BPE 模型，比别的端到端模型如BLT更优。
+\end{abstract}
+
+\section{Introduction}
+
+\subsection{The Tokenization Bottleneck}
+阐述 BPE/SentencePiece 的“静态假设”在面对新颖词汇、代码、DNA 序列时的失效。
+指出 Tokenization 本质上是对算力的预分配，静态分配导致了算力与信息密度的不匹配（高频无义词占用过多算力）。
+
+\subsection{From Hard Boundaries to Soft Concepts}
+批评现有 Byte-level 方法（MegaByte, BLT）虽然去除了词表，但依赖启发式或预测性的“硬边界”，破坏了语义的连续性，且难以端到端优化切分逻辑。分词不应是预处理，而应是模型“理解”过程的一部分（Concept Formation）。
+
+\subsection{Mergenet Proposal}
+概述 Mergenet 架构：Local Encoder (Byte $\to$ "Concept, not only sub-word") $\to$ Latent Encoder (Concept Processing, like formal GPT) $\to$ Decoder (Concept $\to$ Byte)。
+全链路可微，基于内容的动态压缩，LaE 层的 KV Cache 复用同普通GPT模型。
+
+\section{Related Work}
+
+\textbf{Subword-based LLMs:} 简述 BPE 的局限性。
+
+\textbf{Byte-level Modeling:} MegaByte，SpaceByte，MambaByte，BLT，HNet。
+
+\textbf{Dynamic Tokenization \& Boundary Learning:} 对比 BLT 和 H-Net。
+
+\textbf{Critical Differentiation:} 指出它们是从左到右预测边界（不可逆，无梯度回传），而 Mergenet 是基于全局/局部注意力矩阵的聚类（可微，软对齐）。
+
+\textbf{Vision Transformers \& Token Merging:} 提及 TokenLearner, Perceiver, 和 ViT 中的 Token Merging (ToMe)，阐述 Mergenet 如何将视觉领域的“空间聚合”迁移至 NLP 的“时序语义聚合”。
+
+\section{Methods}
+
+\subsection{IO-Aware Rank-1 Bias Injection via Dimension Augmentation}
+传统的相对位置编码或窗口偏置通常需要显式实例化一个偏置矩阵 $\mathbf{B} \in \mathbb{R}^{N \times N}$，这会导致 $O(N^2)$ 的显存开销，并破坏 FlashAttention 等 IO 感知算子的融合机制。针对本架构中广泛存在的“秩-1 (Rank-1)”偏置结构（如基于对数窗口的 $\beta_j = \log S_j$），我们提出了一种维度增广策略，将加法偏置转化为高维空间的矩阵乘法。
+
+我们构建增广的 Query 和 Key 矩阵 $\hat{\mathbf{Q}}, \hat{\mathbf{K}} \in \mathbb{R}^{N \times (d+1)}$：
+\begin{equation}
+    \hat{\mathbf{Q}} = [\mathbf{Q} \mid \sqrt{d} \cdot \mathbf{1}_N], \quad \hat{\mathbf{K}} = [\mathbf{K} \mid \boldsymbol{\beta}]
+\end{equation}
+其中 $\mathbf{1}_N$ 为全 1 列向量，$\boldsymbol{\beta}$ 为偏置向量。对增广矩阵执行标准的 Scaled Dot-Product Attention，其结果在数学上严格等价于注入偏置：
+\begin{equation}
+    \frac{\hat{\mathbf{Q}}\hat{\mathbf{K}}^\top}{\sqrt{d}} = \frac{\mathbf{Q}\mathbf{K}^\top + (\sqrt{d}\cdot\mathbf{1}_N)\boldsymbol{\beta}^\top}{\sqrt{d}} = \text{Score}(\mathbf{Q}, \mathbf{K}) + \mathbf{1}_N \boldsymbol{\beta}^\top
+\end{equation}
+该方法将内存复杂度严格控制在 $O(N)$，且无需修改底层的 CUDA Attention Kernel，完美兼容 FlashAttention 的分块计算逻辑。
+
+\subsection{Continuous Geometric Alignment \& Elastic Grid}
+由于 MergeNet 摒弃了离散的 Token 索引，我们需要在连续空间中重建位置感知能力。
+
+\paragraph{Physical Centroid Calculation (LoE):}
+我们将 Token 的“位置”重定义为其所聚合的 Raw Bytes 的物理质心。位置索引 $c_i$ 不再是整数，而是由源矩阵 $\mathbf{S}$ 和质量向量 $\mathbf{v}$ 决定的动态函数：
+\begin{equation}
+  c_i = \frac{\sum_k S_{i,k} \cdot k}{\mathbf{v}_i + \epsilon}
+\end{equation}
+这意味着位置信息本身是可微的。模型可以通过调整 $\mathbf{S}$（即改变聚类范围）来微调 Concept 在语义空间中的逻辑位置，实现“位置”的端到端学习。
+
+\paragraph{Elastic Grid with Soft Bias (LoD):}
+在解码阶段，为了解决 Concept 与 Byte 的非刚性对应问题，我们摒弃了硬性的边界映射，转而采用基于距离的软网格偏置（Soft Grid Bias）。解码器维护一个基于压缩率 $\lambda$ 的弹性网格，偏置定义为：
+\begin{equation}
+  \text{Bias}_{grid}(t, j) = - \gamma \cdot \left| \frac{t}{\lambda} - j \right|
+\end{equation}
+配合滑动窗口 $\text{SlidingWin}_{grid}$，模型能够关注到当前 Byte 附近的 Latent Concepts。这不仅实现了推理时的平滑对齐，还允许通过梯度下降自动学习最佳的关注跨度（Attention Span）。
+
+\subsection{Parallelized Dynamic Merging \& Storage Optimization}
+\paragraph{Parallel Top-K Merging:}
+原本 DTEM 模拟将模型中 top-k 对最相关的token取出来并进行可微合并需要循环 k 次，高复杂度低并行度，效率低。针对 DTEM 中动态聚类涉及的高昂循环 Top-K 操作，我们引入了基于阈值的并行化处理（Threshold-based Parallel Top-K, inspired by Su et al.）。通过将串行的循环选择转化为可并行计算的阈值掩码操作，解决了动态分词中的计算瓶颈，大幅提升了 LoE 阶段的吞吐量。（\url{https://spaces.ac.cn/archives/10373}）
+
+\paragraph{Quasi-Linear Complexity with Unfold Storage:}
+采用 SlidingWinAttn，同时创新性地使用unfold将带状 size 矩阵和 tokenmap 存储到狭长矩阵中，保证了计算和存储高效，保证了内存访问的连续性。
+
+\subsection{System-Level Hardware Adaptation}
+\textbf{Hardware Alignment Padding:} 为适配 GPU Tensor Cores 的计算特性，我们将增广维度 $d+1$ 自动填充至最近的 8 的倍数 ($d_{\text{phys}}$)。填充位全零初始化，确保在利用硬件加速特性的同时不引入计算噪声。
+
+\textbf{Zero-Copy Inference Mechanism:} 在推理阶段，我们引入持久化 KV Cache 队列 $\mathcal{Q} \in \mathbb{R}^{B \times (2W_{infer}+1) \times d}$。通过预分配显存并采用原地修改策略，直接将计算出的偏置项写入预留通道，实现了前向传播过程中的零内存分配和零数据拷贝。
+
+\section{Experiments}
+\input{tab_lin_attn_350m_commen_sence}
+\input{tab_lin_attn_350m_longbench}
+
+\subsection{Datasets}
+
+\subsection{Setups}
+
+\subsection{Implement Deatils}
+
+\end{document}

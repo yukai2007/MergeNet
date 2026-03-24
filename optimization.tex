@@ -1,0 +1,101 @@
+\documentclass[a4paper,11pt]{article}
+
+% 引入中文支持包 (建议使用 XeLaTeX 编译)
+\usepackage{xeCJK}
+
+% 设置页面边距
+\usepackage{geometry}
+\geometry{left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm}
+
+% 数学公式与符号包
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{bm} % 用于加粗希腊字母
+
+% 超链接包
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+% 设置段落缩进和间距
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.8em}
+
+\title{\textbf{算子效率优化方案}}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section*{算法层面（1）：维度增广策略}
+
+利用偏置项秩-1 (Rank-1) 结构，将偏置加法转化为高维空间的矩阵乘法。旨在消除因显式实例化 $N \times N$ 偏置矩阵 $\mathbf{B}:=\mathbf{1}_N\boldsymbol{\beta}^\top$ 带来的 $O(N^2)$ 内存开销，同时复用标准的 FlashAttention 内核。
+
+\subsection*{输入变换}
+将 Query 和 Key 的特征维度从 $d$ 扩展为 $d+1$：
+\begin{itemize}
+    \item $\hat{\mathbf{Q}} = [\mathbf{Q} \mid \sqrt{d} \cdot \mathbf{1}_N]$：拼接一列乘以 $\sqrt{d}$ 的全 1 向量。
+    \item $\hat{\mathbf{K}} = [\mathbf{K} \mid \boldsymbol{\beta}]$：拼接偏置向量 $\boldsymbol{\beta}$。
+\end{itemize}
+
+\subsection*{数学等价性}
+对增广矩阵执行标准 Scaled Dot-Product，增广维度的计算结果恰好还原为偏置项：
+$$
+\frac{\hat{\mathbf{Q}}\hat{\mathbf{K}}^\top}{\sqrt{d}} = \frac{\mathbf{Q}\mathbf{K}^\top + (\sqrt{d}\cdot\mathbf{1}_N)\boldsymbol{\beta}^\top}{\sqrt{d}} = \text{Score} + \mathbf{B}
+$$
+
+\subsection*{效果}
+内存复杂度降至线性 $O(N)$，且无需修改底层 CUDA Kernel。
+
+\section*{算法层面（2）：连续几何对齐}
+
+传统 Transformer 依赖绝对位置编码，这在变长压缩中会失效。MergeNet 提出了基于物理属性的连续定位。
+
+\subsection*{A. 物理质心计算 (Physical Centroid)}
+Token 的位置不再是整数索引，而是由其构成的原始 Bytes 的位置加权平均得到的浮点数。
+\begin{equation*}
+    c_i = \frac{\sum S_{i,k} \cdot k}{\mathbf{v}_i + \epsilon}
+\end{equation*}
+\textbf{优化点}：位置信息 $c_i$ 变成了源矩阵 $\mathbf{S}$ 和质量 $\mathbf{v}$ 的函数。这意味着模型可以通过调整 $\mathbf{S}$（即调整 Token 包含哪些 Byte）来微调 Token 的逻辑位置，实现了位置信息的端到端学习。
+
+\subsection*{B. 网格偏置/相对连续位置}
+在 LoD 中，摒弃了硬性的每个词对应一段 Byte，而是使用基于距离的软偏置，让附近一段词都可以对当前 Byte 生成产生贡献。
+$$
+\text{Bias}_{grid}(t, j) = - \gamma \cdot \left| \frac{t}{\lambda} - j \right|
+$$
+$$
+\text{SlidingWin}_{grid}(t)=(t,\{x\mid|\text{Bias}_{grid}(t, j)|\le4\times\text{SlidingWinSize}_{LoE}\})
+$$
+这部分其实是维护一个固定大小 KV Cache 的推理队列 $\mathcal{Q} \in \mathbb{R}^{B \times (2W_{infer}+1) \times d}$，而非全量历史。
+
+它建立了一个基于压缩率 $\lambda$ 的弹性网格。这边的窗口大小实现了和 LoE 的对齐。模型也可以通过梯度下降进一步学习到最优的关注范围，使得推理时的滑动窗口能平滑地对齐到 Latent Space。
+
+\section*{算法层面（3）：DTEM 优化改进}
+
+\subsection*{A. Parallel Top-K Merging}
+原本 DTEM 模拟将模型中 top-k 对最相关的 token 取出来并进行可微合并需要循环 $k$ 次，高复杂度低并行度，效率低。
+
+针对 DTEM 中动态聚类涉及的高昂循环 Top-K 操作，我们引入了基于阈值的并行化处理（Threshold-based Parallel Top-K, inspired by Su et al.）。通过将串行的循环选择转化为可并行计算的阈值掩码操作，解决了动态分词中的计算瓶颈，大幅提升了 LoE 阶段的吞吐量。（参考：\url{https://spaces.ac.cn/archives/10373}）
+
+\subsection*{B. 拟线性复杂度}
+采用 \textbf{SlidingWinAttn}，同时创新性地使用 \texttt{unfold} 将带状 size 矩阵和 tokenmap 存储到狭长矩阵中，保证了计算和存储高效，保证了内存访问的连续性。
+
+\section*{系统层面：硬件适配与显存优化}
+
+为最大化 GPU 吞吐量，实施了以下工程优化：
+
+\subsection*{硬件对齐填充}
+将增广维度 $d+1$ 补零填充至 8 的倍数 ($d_{\text{phys}}$)，以满足 Tensor Cores 的对齐要求，确保计算处于最高效模式。
+
+\subsection*{零拷贝机制 (Inference)}
+引入持久化缓存减少内存分配抖动。
+\begin{itemize}
+    \item \textbf{原地修改}：当上游张量预留空间充足时，直接将偏置项写入预留的内存通道。此举在前向传播中实现了零分配和零拷贝。
+\end{itemize}
+
+\end{document}
