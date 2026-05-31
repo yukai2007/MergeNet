@@ -443,4 +443,9 @@ Claude & 自定义Tokenizer & 未知 & 长文本处理优化 \\ \hline
 \end{tabularx}
 \end{table}
 
+\section{延伸阅读：长上下文综述与可学习分词}
+
+Liu 等（\texttt{arXiv:2503.17407}）对长上下文语言模型的\textbf{数据、架构、工作流、基础设施与评测}做了系统综述；其中架构部分对序列缩短、稀疏/线性注意力与混合结构的分类，可作为 MergeNet 类\textbf{可微分词 + latent 瓶颈}工作的文献地图。
+静态子词词表带来的算力分配问题，亦与综述中\textit{有效上下文长度}、Prompt 压缩等工作流方法形成对照；若需将综述论点落实到本项目的架构优先级与实验协议，见 \texttt{MergeNet/LCLM综述与MergeNet对齐.md}。
+
 \end{document}

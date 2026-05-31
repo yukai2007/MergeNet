@@ -32,6 +32,12 @@ MergeNet 提出了一种端到端可微的分层序列生成架构，旨在解�
     \item \textbf{连续软对齐解码 (LoD):} 对应的，我们摒弃了基于熵的硬边界判定，提出基于连续指针 (Pointer) 和网格偏置 (Grid Bias) 的解码机制，实现了变长序列的平滑对齐。
 \end{enumerate}
 
+\section{长上下文与评测对齐（LCLM 综述）}
+
+Liu et al.\ （arXiv:2503.17407）将长上下文能力按\textbf{语言建模 $\rightarrow$ 检索 $\rightarrow$ 聚合 $\rightarrow$ 推理 $\rightarrow$ 真实场景适配}分层评测；MergeNet 中 LoE 负责 byte$\rightarrow$latent 的信息聚合，LaM 在长度 $N\approx L/\lambda$ 的 latent 序列上承担``长上下文''推理主体，LoD 则受 $W_{infer}$ 与 band mask 约束。
+\textbf{协议层面：}固定并在文中披露 $\lambda$、$W_{infer}$、$\#LoT$ 与训练用 band mask，使\textbf{宣称能力}与\textbf{latent 上实际可组合上下文}一致；避免仅报告原始 byte 窗长而忽略压缩与滑窗引入的有效长度损失（参见综述对 RULER、lost-in-the-middle 的讨论）。
+\textbf{实验扩展：}在已有 common sense 与 LongBench 表格基础上，可按综述 Table~6/7 思路补充合成任务（如针检变体）与真实长任务子集，分别探测检索类与聚合--推理类短板；若引入新的 LaE 算子（线性/混合注意力），需在相同 $\lambda$ 下报告吞吐--质量曲线以对齐综述 \S3 的召回--效率权衡叙事。
+详细改进优先级见项目内 \texttt{MergeNet/LCLM综述与MergeNet对齐.md}。
 
 \begin{table}[h]
 \centering
@@ -63,7 +69,7 @@ $B$&批次大小&512&\\
 $X$ & 输入 & $(B, L)$ & 原始字节 ID \\
 $H_i$ & 表征 & $(B,L,d)$ &  \\
 $v_i$ & 质量 & $(B,L)$ & \\
-$S_i$ & Source Matrix & \makecell[l]{$(B,L,L)$\\ \color{red}$(B,L,2\times W+1)$} & \makecell[l]{带状矩阵，Byte 对 Token 的贡献度。\\ 规定 $S_0$ 为恒同映射。} \\[-1.5ex]
+$S_i$ & Source Matrix / Trace & \makecell[l]{$(B,L,L)$\\ \color{red}{local: }$(B,L,2\times W+1)$\\ \color{red}{global: }$(B,L,2L-1)$} & \makecell[l]{Byte 对 Token 的贡献度。local-window 可带状存储；\\ global 若要精确维护需完整相对位置范围。\\ 规定 $S_0$ 为恒同映射。} \\[-1.5ex]
 $C_i$ & 重心 & $(B, L)$ & Token 在原 byte 序列中的重心 \\
 $Z$ & Latent Words (Real) & $(B,N,d)$ & LoE 压缩输出\\
 $O$ & Latent Words (Pred) & $(B,N,d)$ & LaM 预测输出（next Z prediction） \\
@@ -97,7 +103,7 @@ $\mathcal{Q}$ & Inference Queue & $(B, W_{infer}, d)$ & 推理时的潜在语义
     \item 随机分组
 \begin{itemize}
     \item 将当前序列索引随机划分为大小为 $N_a$ 的 Group A (Source) 和 大小为 $N_b$ 的 Group B (Target)。
-    \item 状态变量：$H_a:=S_{i-1,a}H_{i,a}, H_b:=S_{i-1,b}H_{i,b}$ (Embeddings), $v_{i-1,a}, v_{i-1,b}$ (Mass), $S_{i-1,a}, S_{i-1,b}$ (Source Matrix)。
+    \item 状态变量：$H_a,H_b$ (Embeddings), $v_{i-1,a}, v_{i-1,b}$ (Mass), $S_{i-1,a}, S_{i-1,b}$ (Source Matrix)。在 OpenToMe 视觉实现中，metric 的输入可由 source trace 对每层 local block 输出做聚合；\texttt{center} 模式则只维护质心近似。
 \end{itemize}
     \item  相似度与分配
     
@@ -110,7 +116,7 @@ $\mathcal{Q}$ & Inference Queue & $(B, W_{infer}, d)$ & 推理时的潜在语义
     \item \textbf{Update Group B (Absorb):}
     \begin{align*}
         \text{Size: } & v_{i,b} = v_{i-1,b} + T_{ab}^{T}v_{i-1,a} \\
-        \text{Source: } & {S}_{i,b} = S_{i-1,b} + T_{ab}^{T}S_{i-1,a}
+        \text{Source: } & {S}_{i,b} = S_{i-1,b} + \operatorname{Shift}_{a\rightarrow b}(T_{ab}, S_{i-1,a})
     \end{align*}
 
     \item \textbf{Update Group A (Decay):}
@@ -124,11 +130,11 @@ $\mathcal{Q}$ & Inference Queue & $(B, W_{infer}, d)$ & 推理时的潜在语义
 \end{enumerate}
 \subsubsection{质心计算}
 
-利用更新后的 Source Matrix 计算每个 Token 在原始序列中的物理重心。这是后续时序排序的依据。
+利用更新后的 Source Matrix 或轻量 center trace 计算每个 Token 在原始序列中的物理重心。这是后续时序排序的依据。
 
 对于第 $i$ 个 Token：
     $c_{i} = \frac{\sum_{k=0}^{L-1} S_{i,k} \cdot k}{v_{i} + \epsilon}$
-    $S_{i,k}$: Token $i$ 中来自原始位置 $k$ 的绝对贡献量，这边默认承认使用 $S_{\#LoT}$。
+    $S_{i,k}$: Token $i$ 中来自原始位置 $k$ 的绝对贡献量，这边默认承认使用 $S_{\#LoT}$。若使用 \texttt{center} 模式，则直接维护 $c_i$ 而不显式保存 $S_{i,k}$。
 
 \subsubsection{Downsampling \& Aggregation (Perceiver-style)}
 
@@ -144,6 +150,7 @@ $\mathcal{Q}$ & Inference Queue & $(B, W_{infer}, d)$ & 推理时的潜在语义
         &K, V = H_{\#LoT} \\
         &Bias_{i,j} = \log(S_{\#LoT}[k_i, j] + \epsilon)
     \end{align}
+    这个 source-aware bias 只对应完整 source matrix 路径；若采用轻量 center trace，则没有该项 source bias。OpenToMe 当前 CLS 分类路径还未消费 \texttt{token\_center}，因此 center 模式在该路径中应视作 dense source/bias off 的下界。
     
     \item \textbf{Operation:}
         $Z = \text{Softmax}\left(\frac{Q_{down}K^{T}}{\sqrt{d}} + Bias\right)V\in \mathbb{R}^{N \times d}$

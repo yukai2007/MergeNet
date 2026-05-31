@@ -35,7 +35,7 @@ transformers在建模语言方面表现卓越，但在内存和时间复杂度�
 \textbf{Mergenet 核心创新：}提出一种全局可微的层级架构。
 \begin{itemize}
     \item 引入 DTEM (Decoupled Token Embedding Merging) 机制，在 LoE 阶段通过可学习的度量动态聚类 Byte 序列。
-    \item 利用 Perceiver-style Cross-Attention （perciever）将聚合后的语义“概念”压缩为固定长度的 Latent Vectors，实现高压缩率。
+    \item 利用 Perceiver-style Cross-Attention （Perceiver）将聚合后的语义“概念”压缩为固定长度的 Latent Vectors，实现高压缩率。
     \item LoD连续滑动解码结合重建损失，确保生成过程的语义对齐。
 \end{itemize}
 
@@ -66,6 +66,12 @@ transformers在建模语言方面表现卓越，但在内存和时间复杂度�
 \textbf{Critical Differentiation:} 指出它们是从左到右预测边界（不可逆，无梯度回传），而 Mergenet 是基于全局/局部注意力矩阵的聚类（可微，软对齐）。
 
 \textbf{Vision Transformers \& Token Merging:} 提及 TokenLearner, Perceiver, 和 ViT 中的 Token Merging (ToMe)，阐述 Mergenet 如何将视觉领域的“空间聚合”迁移至 NLP 的“时序语义聚合”。
+
+\subsection{与长上下文语言模型（LCLM）综述脉络的对应}
+近期综述 Liu et al.\ （arXiv:2503.17407）将长上下文研究按数据、架构、工作流、基础设施、评测与行为分析等维度组织（RQ1--RQ3）。
+\textbf{MergeNet 的主定位在 RQ1 的架构侧：}在\textbf{表示层}通过可微合并（DTEM）与 Perceiver bottleneck 缩短有效序列长度、降低 LaE 注意力成本，属于``序列抽象 / 高效注意力''分支，而非推理期 KV 压缩（\S5）、亦非外挂式 Prompt 压缩或 RAG 流水线（工作流 \S4）---写作时需在 Related Work 中显式划界。
+LaE 可选用线性注意力、窗口注意力或混合结构，与综述 \S3 中次线性/混合架构对应；连续质心 $c_i$ 与弹性网格偏置则与位置编码、外推及\textit{有效上下文长度}（如 RULER、lost-in-the-middle）的讨论相关，实验上应联合报告压缩率 $\lambda$、推理窗 $W_{infer}$ 与下游长任务，避免仅宣称原始 byte 窗长。
+\textbf{数据与训练（综述 \S2）}可作为后续迭代：长文过滤、长度配比与 GrowLength 式课程是否适配 byte 噪声与高压缩率，需在扩展实验中单独验证（详见 \texttt{MergeNet/LCLM综述与MergeNet对齐.md} 与 \texttt{optimization.tex} 补充清单）。
 
 \section{Methods}
 
@@ -112,6 +118,7 @@ transformers在建模语言方面表现卓越，但在内存和时间复杂度�
 \textbf{Zero-Copy Inference Mechanism:} 在推理阶段，我们引入持久化 KV Cache 队列 $\mathcal{Q} \in \mathbb{R}^{B \times (2W_{infer}+1) \times d}$。通过预分配显存并采用原地修改策略，直接将计算出的偏置项写入预留通道，实现了前向传播过程中的零内存分配和零数据拷贝。
 
 \section{Experiments}
+评测与报告协议对齐 LCLM 综述 \S6--\S7 思路：除 LongBench 与 common sense 外，应披露 $\lambda$、$W_{infer}$ 及 LaE 算子配置，并区分合成任务与真实长任务（详见 \texttt{MergeNet/LCLM综述与MergeNet对齐.md}）。
 \input{tab_lin_attn_350m_commen_sence}
 \input{tab_lin_attn_350m_longbench}
 

@@ -85,6 +85,14 @@ $$
 \subsection*{B. 拟线性复杂度}
 采用 \textbf{SlidingWinAttn}，同时创新性地使用 \texttt{unfold} 将带状 size 矩阵和 tokenmap 存储到狭长矩阵中，保证了计算和存储高效，保证了内存访问的连续性。
 
+\subsection*{C. Source Trace 存储边界}
+OpenToMe 视觉实现中已经将 source trace 明确拆成 \texttt{matrix}、\texttt{detached}、\texttt{center}、\texttt{none} 四种模式。需要注意：
+\begin{itemize}
+    \item local-window DTEM 的 source matrix 可以用带状相对位置存储，宽度为 $2\cdot W_{local}\cdot D_{local}+1$。
+    \item global DTEM 若要语义正确维护 source matrix，不能沿用窄带存储，也不能跳过更新；它需要 $2L_{full}-1$ 的完整相对位置范围，并在 merge 时按 $a-b$ 的位置差平移 source mass。
+    \item \texttt{center} 模式只保留 no-grad 质心，能减少显存，但不等价于完整 source matrix，因为 Perceiver-style cross attention 不再获得 $\log S$ bias。当前 CLS 分类路径还未消费 \texttt{token\_center}，所以现有 off 脚本应解读为 dense source/bias off 下界；若要真正 center-guided，需要补 center-band bias 或至少用 center trace 排序。
+\end{itemize}
+
 \section*{系统层面：硬件适配与显存优化}
 
 为最大化 GPU 吞吐量，实施了以下工程优化：
@@ -96,6 +104,34 @@ $$
 引入持久化缓存减少内存分配抖动。
 \begin{itemize}
     \item \textbf{原地修改}：当上游张量预留空间充足时，直接将偏置项写入预留的内存通道。此举在前向传播中实现了零分配和零拷贝。
+\end{itemize}
+
+\section*{与 LCLM 综述（arXiv:2503.17407）对齐的后续方向}
+
+以下条目与 Liu et al.\ 长上下文综述的章节对应，便于实现与实验分工；全文展开见 \texttt{MergeNet/LCLM综述与MergeNet对齐.md}。
+
+\subsection*{数据与课程（综述 \S2）}
+\begin{itemize}
+    \item 长文预训练/继续训练：过滤准则、长程依赖指标与\textbf{byte + 高压缩率 $\lambda$}是否匹配；可尝试 GrowLength 式渐进加长。
+    \item 若引入针对 lost-in-the-middle 的合成长上下文数据，需与 LoD 的滑动窗与 $W_{infer}$ 训练设定一致。
+\end{itemize}
+
+\subsection*{架构与算子（综述 \S3；本文 LaE / LaM）}
+\begin{itemize}
+    \item 在固定 $\lambda$ 下系统对比线性注意力、窗口注意力与混合层（与 OpenToMe/flame 实验线一致），报告\textbf{召回--吞吐}与长任务指标。
+    \item 连续质心 $c_i$ 与 RoPE/外推方法（PI、YaRN 等）的\textbf{联合或冲突}：优先用小规模长序列 PPL 或针检消融。
+\end{itemize}
+
+\subsection*{系统与推理（综述 \S5）}
+\begin{itemize}
+    \item 明确\textbf{prefill}成本主要来自 LoE+LaE 对长 byte/latent 的处理；\textbf{decode}成本来自 LoD 与队列 $\mathcal{Q}$ 的访存带宽。
+    \item KV 量化、PD 分离、投机解码等与当前 rank-1 增广、FlashAttention 兼容路径\textbf{正交}；落地时写清作用层级（仅 LaE、或服务侧）。
+\end{itemize}
+
+\subsection*{评测与分析（综述 \S6--\S7）}
+\begin{itemize}
+    \item 除 LongBench 外，组合合成任务与真实长任务；报告 $\lambda$、$W_{infer}$ 与有效 latent 跨度。
+    \item 关注\textbf{有效上下文}（RULER 等）与 LongPPL 类指标是否与下游相关，避免单一合成集过拟合。
 \end{itemize}
 
 \end{document}

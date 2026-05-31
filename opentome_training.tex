@@ -1,0 +1,593 @@
+\documentclass[a4paper,11pt]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{makecell}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% 设置页面边距
+\geometry{left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm}
+
+\title{\textbf{OpenToMe 双分支分类训练：\\架构设计与训练策略详解}}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{概览}
+
+本文档详细描述了 OpenToMe 项目中基于 HybridToMeViT 的 CIFAR-100 分类训练流程。整个实验方案分为两步（P1 路线）：
+
+\begin{enumerate}
+    \item \textbf{第一步（Branch A 单独训练）：} 训练一个无空间降采样的单分支模型，作为基线与后续双分支训练的初始化。
+    \item \textbf{第二步（Dual AB 双分支训练）：} 在分支 A 基础上引入带压缩能力的分支 B，通过三种训练策略（T1 Joint / T2 Alternate / T3 Staged）探索最优的双分支协同方式。
+\end{enumerate}
+
+对应四个训练脚本：
+\begin{itemize}
+    \item \texttt{c100\_branch\_a\_deit\_aligned.sh} — 第一步：单分支 A 基线
+    \item \texttt{c100\_dual\_ab\_t1\_joint.sh} — 第二步 T1：联合训练
+    \item \texttt{c100\_dual\_ab\_t2\_alternate.sh} — 第二步 T2：交替训练
+    \item \texttt{c100\_dual\_ab\_t3\_staged.sh} — 第二步 T3：分段训练
+\end{itemize}
+
+%=============================================================================
+\section{符号定义}
+%=============================================================================
+
+\begin{table}[h]
+\centering
+\caption{核心符号定义表}
+\begin{tabular}{l l l l}
+\toprule
+\textbf{符号} & \textbf{定义} & \textbf{参考值} & \textbf{备注} \\
+\midrule
+$N_p$ & Patch 总数 & $784$ & 当前 2k MergeNet 脚本使用 patch size $8$，即 $(224/8)^2$ \\
+$L_{full}$ & Local Encoder 含 CLS 的完整序列长度 & $785$ & $N_p + 1$ \\
+$L_{trace}$ & Top-k 后进入 Latent Encoder 的序列长度 & $197$ & $N_p - M_{local} + 1$，含 CLS \\
+$d$ & 隐层维度 & $384$ & Small 架构 \\
+$h$ & 注意力头数 & $6$ & Small 架构 \\
+$D_{local}$ & Local Encoder 层数 & $4$ & \\
+$D_{latent}$ & Latent Encoder 层数 & $8$ & \\
+$\lambda$ & 目标压缩率 & \makecell[l]{A: $1.0$\\ B: $4.0$} & $\lambda=1$ 表示不压缩 \\
+$M_{local}$ & Local 阶段目标合并质量 & $\lfloor N_p \cdot \frac{\lambda-1}{\lambda} \rfloor$ & A: $0$，B: $588$ \\
+$M_{latent}$ & Latent 阶段总合并 token 数 & 配置 & 默认 $0$ \\
+$C$ & 分类类别数 & $100$ & CIFAR-100 \\
+$t$ & DTEM 时间参数 & $1$ & \\
+$s_{mg}$ & Metric 梯度缩放比例 & $0.1$ & 10\% 梯度通过 \\
+$\lambda_B$ & 分支 B 损失权重 & $1.0$ & 用于 Joint/Staged \\
+$\lambda_f$ & 融合损失权重 & $0.2$ & 当前 \texttt{1000s2}/\texttt{2000s2} 脚本启用 fused loss \\
+$E_{stage}$ & Staged 模式切换 epoch & $100$ & T3 专用 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{公共训练协议}
+%=============================================================================
+
+四个脚本共享一致的数据/增强/优化器配置，与 DeiT-Small 对齐：
+
+\begin{table}[h]
+\centering
+\caption{公共训练超参数}
+\begin{tabular}{l l p{8cm}}
+\toprule
+\textbf{参数} & \textbf{值} & \textbf{说明} \\
+\midrule
+数据集 & CIFAR-100 & 100 类，\texttt{train}/\texttt{val} 划分 \\
+图像尺寸 & $224 \times 224$ & 与 DeiT 保持一致 \\
+Patch Size & $8$ & $28 \times 28 = 784$ 个 patch；旧版 patch size 16 文档不适用于当前 2k 脚本 \\
+Batch Size & $50 \times 4$ GPU & \texttt{1000s2}/\texttt{2000s2} 默认 4 卡，全局有效批大小 $=200$ \\
+Epochs & $1000$ 或 $2000$ & \texttt{1000s2.sh} 为 1000；source matrix 消融脚本为 2000 \\
+优化器 & AdamW & $\text{lr}=10^{-3}$，$\text{wd}=0.05$ \\
+调度器 & Cosine & Warmup $20$ epochs \\
+梯度裁剪 & $1.0$ & \\
+数据增强 & \makecell[l]{Mixup $0.8$, CutMix $1.0$, \\ Label Smoothing $0.1$, \\ RandAugment \texttt{rand-m9-mstd0.5-inc1}} & \\
+精度 & AMP (混合精度) & \\
+随机种子 & $42$ & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{第一步：单分支 A 训练 (\texttt{c100\_branch\_a\_deit\_aligned.sh})}
+%=============================================================================
+
+\subsection{模型注册名}
+
+\texttt{hybridtomevit\_small\_cls\_branch\_a}
+
+\subsection{架构定义}
+
+分支 A 是一个 \textbf{不进行空间 token 降采样} 的 HybridToMeViT，用作 DeiT-Small 的结构化对照。
+
+工厂函数强制设置：
+\begin{align*}
+    \texttt{lambda\_local} &= 1.0 \quad \Rightarrow \quad M_{local} = N_p \cdot \frac{1-1}{1} = 0 \\
+    \texttt{total\_merge\_latent} &= 0
+\end{align*}
+
+即 Local Encoder 和 Latent Encoder \textbf{均不执行任何 token 合并}。同时设置 \texttt{remove\_decoder\_cross\_attention=True}，移除解码器交叉注意力模块。
+
+\subsection{前向流程}
+
+\begin{enumerate}
+    \item \textbf{Patch Embedding + Position Embedding}
+    
+    输入图像 $x \in \mathbb{R}^{B \times 3 \times 224 \times 224}$ 经 Patch Embedding 转换为 token 序列：
+    \[
+        X = \text{PatchEmbed}(x) + \text{PosEmbed} \in \mathbb{R}^{B \times L \times d}
+    \]
+    其中 $L_{full} = N_p + 1 = 785$（包含 CLS token）。
+    
+    \item \textbf{Local Encoder（4 层 Transformer Block）}
+    
+    依次经过 $D_{local}=4$ 层 \texttt{LocalBlock}（windowed local attention，而非全局 TimmBlock）：
+    \[
+        H_i = \text{Block}_i(H_{i-1}), \quad i = 1, \dots, 4
+    \]
+    每层输出 $H_i \in \mathbb{R}^{B \times L \times d}$ 被缓存，用于后续 DTEM 的 metric 计算。
+    
+    由于 $\lambda=1.0$，DTEM 的每层合并数 $r = M_{local} / D_{local} = 0$，\textbf{不执行实际合并}，序列长度始终为 $L$。
+
+    \item \textbf{DTEM Metric 计算（虽不合并，但结构存在）}
+    
+    对每层输出 $H_i$，经 source matrix 聚合后做梯度缩放：
+    \[
+        H_{metric} = H_i \cdot s_{mg} + H_i^{\text{detach}} \cdot (1 - s_{mg})
+    \]
+    再通过 metric 层生成合并度量。由于 $r=0$，合并操作被跳过。
+
+    \item \textbf{Latent Encoder（8 层 Transformer Block）}
+    
+    Top-N 选择 + Perceiver-style 交叉注意力后，进入 $D_{latent}=8$ 层 Latent Encoder。由于 $M_{latent}=0$，Latent 阶段也不进行 token 合并。
+
+    \item \textbf{分类头}
+    
+    取 CLS token 的表征，经线性层输出 logits：
+    \[
+        \hat{y} = W_{head} \cdot Z_{\text{CLS}} + b_{head} \in \mathbb{R}^{B \times C}
+    \]
+\end{enumerate}
+
+\subsection{损失函数}
+
+标准交叉熵损失（含 Label Smoothing $\epsilon=0.1$ 和 Mixup/CutMix 软标签）：
+\[
+    \mathcal{L}_A = \text{CE}(\hat{y}_A, \tilde{y})
+\]
+
+\subsection{设计意图}
+
+\begin{itemize}
+    \item 与 DeiT-Small 共享完全相同的训练协议（数据增强、epoch、优化器），仅将 DeiT 替换为 HybridToMeViT 结构。
+    \item 由于不做 token 合并，模型行为近似标准 ViT，可作为消融实验的基线。
+    \item 训练得到的 checkpoint 可直接加载到双分支模型的 Branch A 中，为第二步训练提供热启动。
+\end{itemize}
+
+%=============================================================================
+\section{第二步：双分支模型架构}
+%=============================================================================
+
+\subsection{模型注册名}
+
+\texttt{hybridtomevit\_small\_cls\_dual\_ab}
+
+\subsection{CLSDualBranchHybridToMeModel 架构}
+
+双分支模型由 \textbf{分支 A}、\textbf{分支 B}、\textbf{融合模块} 三部分组成：
+
+\begin{table}[h]
+\centering
+\caption{双分支架构对比}
+\begin{tabular}{l c c}
+\toprule
+\textbf{属性} & \textbf{分支 A（无压缩）} & \textbf{分支 B（压缩）} \\
+\midrule
+模型类 & \texttt{CLSHybridToMeModel} & \texttt{CLSHybridToMeModel} \\
+$\lambda_{local}$ & $1.0$（固定） & $4.0$（可配置） \\
+$M_{local}$ & $0$ & $588$ \\
+$M_{latent}$ & $0$ & $0$（可配置） \\
+Token 合并 & 不合并 & \textbf{执行 DTEM 合并} \\
+解码交叉注意力 & 移除 & 移除 \\
+编码交叉注意力 & 保留但 A 路径通常等价轻量通过 & B 路径正常使用，用于 top-k token 从 full local tokens 获取语义 \\
+分类头 & 独立线性层 & 独立线性层 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{共享参数}
+
+为避免优化器重复计数，并约束两路在同一表征空间内学习，分支 A 与 B 的以下参数被\textbf{绑定共享}（通过 \texttt{\_tie\_shared\_embeddings}）：
+\begin{itemize}
+    \item \texttt{patch\_embed}（Patch Embedding 层）
+    \item \texttt{cls\_token}（CLS Token）
+    \item \texttt{pos\_embed}（位置编码）
+    \item \texttt{norm\_pre}（前置 LayerNorm）
+    \item \texttt{local.vit.blocks}（4 层 \texttt{LocalBlock}）
+    \item \texttt{local.metric\_layers}（DTEM metric heads）
+    \item \texttt{latent}（Latent Encoder）
+    \item \texttt{encode/decode\_cross\_attention}（CLS 路径中 decode 不使用，tie 主要去掉 dead 副本）
+\end{itemize}
+
+不共享的是两个分支各自的分类 \texttt{head} 和融合头。两个分支主要差异来自 token 调度：A 路径 $\lambda=1$ 不合并，B 路径按 $\lambda_B$ 做 soft merge + top-k 压缩。
+
+\subsubsection{前向传播}
+
+\texttt{forward(x, active\_branch='both'|'a'|'b')} 的行为根据 \texttt{active\_branch} 参数决定：
+
+\begin{itemize}
+    \item \texttt{active\_branch='both'}：同时前向两个分支，输出融合 logits。
+    \item \texttt{active\_branch='a'}：仅前向分支 A，输出 $\hat{y}_A$。
+    \item \texttt{active\_branch='b'}：仅前向分支 B，输出 $\hat{y}_B$。
+\end{itemize}
+
+当 \texttt{active\_branch='both'} 时的融合过程：
+
+\paragraph{Cat-Linear 融合（默认）：}
+\[
+    \hat{y}_{fused} = W_f \cdot [\hat{y}_A \| \hat{y}_B] + b_f \in \mathbb{R}^{B \times C}
+\]
+其中 $W_f \in \mathbb{R}^{C \times 2C}$，$[\cdot \| \cdot]$ 表示沿特征维度拼接。
+
+\paragraph{Scalar Blend 融合（可选）：}
+\[
+    \hat{y}_{fused} = \sigma(\alpha) \cdot \hat{y}_A + (1 - \sigma(\alpha)) \cdot \hat{y}_B
+\]
+其中 $\alpha$ 为可学习标量参数。
+
+\subsubsection{Branch A Checkpoint 加载}
+
+双分支模型支持从第一步训练得到的单分支 A checkpoint 初始化：
+\begin{enumerate}
+    \item 读取 checkpoint 中的 \texttt{state\_dict}。
+    \item 为每个 key 添加 \texttt{branch\_a.} 前缀。
+    \item 以 \texttt{strict=False} 加载到双分支模型中（允许 branch\_b 和 fusion\_head 的参数缺失）。
+\end{enumerate}
+
+%=============================================================================
+\section{T1：Joint 联合训练 (\texttt{c100\_dual\_ab\_t1\_joint.sh})}
+%=============================================================================
+
+\subsection{核心思想}
+
+每个训练 step 同时前向两个分支，将两路损失线性加权求和进行反向传播。
+
+\subsection{专有参数}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l l}
+\toprule
+\textbf{参数} & \textbf{值} & \textbf{说明} \\
+\midrule
+\texttt{dual\_branch\_train\_mode} & \texttt{joint} & 联合训练模式 \\
+\texttt{dual\_branch\_loss\_weight} ($\lambda_B$) & $1.0$ & 分支 B 损失权重 \\
+\texttt{dual\_fused\_loss\_weight} ($\lambda_f$) & $0.2$ & 当前 stage2 脚本启用融合损失 \\
+\texttt{dtem\_t} & $1$ & DTEM 时间参数 \\
+\texttt{metric\_grad\_scale} ($s_{mg}$) & $0.1$ & Metric 梯度缩放 \\
+\texttt{branch\_b\_lambda\_local} & $4.0$ & 分支 B 压缩率 \\
+\texttt{branch\_b\_total\_merge\_latent} & $0$ & 分支 B Latent 合并数 \\
+\texttt{fusion\_type} & \texttt{cat\_linear} & 融合方式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{训练流程}
+
+\begin{algorithm}[h]
+\caption{T1 Joint 联合训练 — 单个 Step}
+\begin{algorithmic}[1]
+\STATE 输入批次 $(x, y)$，应用 Mixup/CutMix $\rightarrow (x, \tilde{y})$
+\STATE \texttt{active\_branch} $\leftarrow$ \texttt{'both'}（Joint 模式下恒为 both）
+\STATE $(\hat{y}_A, \text{aux}_A) \leftarrow \text{BranchA}(x)$
+\STATE $(\hat{y}_B, \text{aux}_B) \leftarrow \text{BranchB}(x)$
+\STATE $\hat{y}_{fused} \leftarrow \text{Fusion}([\hat{y}_A \| \hat{y}_B])$
+\STATE $\mathcal{L} \leftarrow \text{CE}(\hat{y}_A, \tilde{y}) + \lambda_B \cdot \text{CE}(\hat{y}_B, \tilde{y})$
+\IF{$\lambda_f > 0$}
+    \STATE $\mathcal{L} \leftarrow \mathcal{L} + \lambda_f \cdot \text{CE}(\hat{y}_{fused}, \tilde{y})$
+\ENDIF
+\STATE 反向传播 $\mathcal{L}$，梯度裁剪，优化器更新
+\STATE 验证指标使用 $\hat{y}_{fused}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{损失分析}
+
+\[
+    \mathcal{L}_{T1} = \underbrace{\text{CE}(\hat{y}_A, \tilde{y})}_{\text{分支 A 监督}} + \lambda_B \cdot \underbrace{\text{CE}(\hat{y}_B, \tilde{y})}_{\text{分支 B 监督}} + \lambda_f \cdot \underbrace{\text{CE}(\hat{y}_{fused}, \tilde{y})}_{\text{融合监督（默认禁用）}}
+\]
+
+当 $\lambda_B=1.0$, $\lambda_f=0.2$ 时，两个分支受到等权重的独立监督，融合头也获得较弱的直接监督。若 $\lambda_f=0$，融合头仅通过验证/推理路径使用而不直接参与训练损失。
+
+\subsection{特点}
+
+\begin{itemize}
+    \item \textbf{优势：} 两分支同步学习，梯度信号完整；融合头从一开始就能看到两路 logits 的联合分布。
+    \item \textbf{代价：} 每步需要前向两个完整分支，显存占用约为单分支的 $2\times$。
+    \item \textbf{共享梯度：} 由于 patch\_embed 和 pos\_embed 被绑定，两路梯度会在共享参数上叠加。
+\end{itemize}
+
+%=============================================================================
+\section{T2：Alternate 交替训练 (\texttt{c100\_dual\_ab\_t2\_alternate.sh})}
+%=============================================================================
+
+\subsection{核心思想}
+
+奇偶 step 交替只前向/反传单个分支，\textbf{显存上只需维持单分支的激活}。
+
+\subsection{专有参数}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l l}
+\toprule
+\textbf{参数} & \textbf{值} & \textbf{说明} \\
+\midrule
+\texttt{dual\_branch\_train\_mode} & \texttt{alternate} & 交替训练模式 \\
+\texttt{dtem\_t} & $1$ & DTEM 时间参数 \\
+\texttt{metric\_grad\_scale} & $0.1$ & Metric 梯度缩放 \\
+\texttt{branch\_b\_lambda\_local} & $4.0$ & 分支 B 压缩率 \\
+\texttt{fusion\_type} & \texttt{cat\_linear} & 融合方式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Active Branch 调度}
+
+设全局步数 $\text{step} = \text{epoch} \times |\text{loader}| + \text{batch\_idx}$，则：
+
+\[
+    \texttt{active\_branch} = \begin{cases}
+        \texttt{'a'} & \text{if } \text{step} \bmod 2 = 0 \\
+        \texttt{'b'} & \text{if } \text{step} \bmod 2 = 1
+    \end{cases}
+\]
+
+\subsection{训练流程}
+
+\begin{algorithm}[h]
+\caption{T2 Alternate 交替训练 — 单个 Step}
+\begin{algorithmic}[1]
+\STATE 输入批次 $(x, y)$，应用 Mixup/CutMix $\rightarrow (x, \tilde{y})$
+\STATE $\text{step} \leftarrow \text{epoch} \times |\text{loader}| + \text{batch\_idx}$
+\IF{$\text{step} \bmod 2 = 0$}
+    \STATE $(\hat{y}, \_) \leftarrow \text{BranchA}(x)$
+    \STATE $\mathcal{L} \leftarrow \text{CE}(\hat{y}_A, \tilde{y})$
+\ELSE
+    \STATE $(\hat{y}, \_) \leftarrow \text{BranchB}(x)$
+    \STATE $\mathcal{L} \leftarrow \text{CE}(\hat{y}_B, \tilde{y})$
+\ENDIF
+\STATE 反向传播 $\mathcal{L}$，梯度裁剪，优化器更新
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{损失分析}
+
+单步仅计算一个分支的损失：
+\[
+    \mathcal{L}_{T2}^{(step)} = \begin{cases}
+        \text{CE}(\hat{y}_A, \tilde{y}) & \text{step 为偶数} \\
+        \text{CE}(\hat{y}_B, \tilde{y}) & \text{step 为奇数}
+    \end{cases}
+\]
+
+\subsection{特点}
+
+\begin{itemize}
+    \item \textbf{优势：} 显存消耗与单分支相同——每步仅前向和反传一个分支。
+    \item \textbf{代价：} 每个分支每两步才更新一次；融合头在训练中\textbf{不参与前向}（因为不会走到 \texttt{active\_branch='both'}），仅在验证时使用。
+    \item \textbf{共享参数更新：} 虽然交替训练，但由于 patch\_embed 等参数共享，每步都会得到来自当前活跃分支的梯度更新。
+    \item \textbf{验证阶段：} 验证时默认 \texttt{active\_branch='both'}，融合头仍会输出 $\hat{y}_{fused}$。
+\end{itemize}
+
+%=============================================================================
+\section{T3：Staged 分段训练 (\texttt{c100\_dual\_ab\_t3\_staged.sh})}
+%=============================================================================
+
+\subsection{核心思想}
+
+将训练分为两个阶段：前 $E_{stage}$ 个 epoch 仅训练分支 A（让其充分收敛），之后切换为 Joint 模式同时训练两个分支。
+
+\subsection{专有参数}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l l}
+\toprule
+\textbf{参数} & \textbf{值} & \textbf{说明} \\
+\midrule
+\texttt{dual\_branch\_train\_mode} & \texttt{staged} & 分段训练模式 \\
+\texttt{dual\_stage\_b\_start\_epoch} ($E_{stage}$) & $100$ & 阶段切换 epoch \\
+\texttt{dual\_branch\_loss\_weight} ($\lambda_B$) & $1.0$ & 阶段 2 中分支 B 权重 \\
+\texttt{dtem\_t} & $1$ & DTEM 时间参数 \\
+\texttt{metric\_grad\_scale} & $0.1$ & Metric 梯度缩放 \\
+\texttt{branch\_b\_lambda\_local} & $4.0$ & 分支 B 压缩率 \\
+\texttt{fusion\_type} & \texttt{cat\_linear} & 融合方式 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Active Branch 调度}
+
+\[
+    \texttt{active\_branch} = \begin{cases}
+        \texttt{'a'} & \text{if } \text{epoch} < E_{stage} \quad \text{（阶段 1）} \\
+        \texttt{'both'} & \text{if } \text{epoch} \geq E_{stage} \quad \text{（阶段 2）}
+    \end{cases}
+\]
+
+\subsection{训练流程}
+
+\begin{algorithm}[h]
+\caption{T3 Staged 分段训练}
+\begin{algorithmic}[1]
+\FOR{epoch $= 0$ \TO $199$}
+    \FOR{each batch $(x, y)$}
+        \STATE 应用 Mixup/CutMix $\rightarrow (x, \tilde{y})$
+        \IF{epoch $< E_{stage}$}
+            \STATE \textcolor{blue}{\textbf{// 阶段 1：仅训练分支 A}}
+            \STATE $(\hat{y}_A, \_) \leftarrow \text{BranchA}(x)$
+            \STATE $\mathcal{L} \leftarrow \text{CE}(\hat{y}_A, \tilde{y})$
+        \ELSE
+            \STATE \textcolor{blue}{\textbf{// 阶段 2：联合训练（与 T1 Joint 相同）}}
+            \STATE $(\hat{y}_A, \_) \leftarrow \text{BranchA}(x)$
+            \STATE $(\hat{y}_B, \_) \leftarrow \text{BranchB}(x)$
+            \STATE $\hat{y}_{fused} \leftarrow \text{Fusion}([\hat{y}_A \| \hat{y}_B])$
+            \STATE $\mathcal{L} \leftarrow \text{CE}(\hat{y}_A, \tilde{y}) + \lambda_B \cdot \text{CE}(\hat{y}_B, \tilde{y})$
+        \ENDIF
+        \STATE 反向传播 $\mathcal{L}$，梯度裁剪，优化器更新
+    \ENDFOR
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{损失分析}
+
+\[
+    \mathcal{L}_{T3} = \begin{cases}
+        \text{CE}(\hat{y}_A, \tilde{y}) & \text{epoch} < 100 \quad \text{（阶段 1）} \\[6pt]
+        \text{CE}(\hat{y}_A, \tilde{y}) + \lambda_B \cdot \text{CE}(\hat{y}_B, \tilde{y}) & \text{epoch} \geq 100 \quad \text{（阶段 2）}
+    \end{cases}
+\]
+
+\subsection{特点}
+
+\begin{itemize}
+    \item \textbf{阶段 1 的优势：} 分支 A 在无干扰情况下充分训练 100 个 epoch，获得高质量的初始特征。
+    \item \textbf{阶段 2 的优势：} 分支 B 在分支 A 已经稳定的基础上开始学习，避免两分支早期同时从零开始的不稳定性。
+    \item \textbf{对比 Branch A Checkpoint：} 若同时使用 \texttt{branch\_a\_checkpoint}，则阶段 1 相当于对已有 checkpoint 进行微调；不使用时，阶段 1 从零训练分支 A。
+    \item \textbf{显存特性：} 阶段 1 显存消耗与单分支相同；阶段 2 与 T1 Joint 相同。
+\end{itemize}
+
+%=============================================================================
+\section{分支 B 的 Token 合并详解}
+%=============================================================================
+
+分支 B 是双分支模型的核心创新——它引入了 DTEM（可微令牌合并）机制来压缩 token 序列。
+
+\subsection{压缩率与合并数}
+
+给定当前正常超参 $\lambda_B = 4.0$，patch size $8$ 下 $N_p = 784$：
+\[
+    M_{local} = \left\lfloor 784 \times \frac{4-1}{4} \right\rfloor = 588
+\]
+
+即目标是从 $784$ 个 patch token 中保留约 $196$ 个高质量 token（加上 CLS 共 $197$ 个）进入 Latent Encoder。当前训练实现并不是每层物理删除 token，而是 soft merge：Group A 的质量衰减，Group B 吸收质量和特征，A/B token 仍保留并按原空间位置重排；真正的降采样发生在 Local Encoder 结束后的 top-k selection。
+
+\subsection{逐层合并过程}
+
+每层 DTEM 的目标转移量 $r = M_{local} / D_{local} = 147$：
+
+\begin{enumerate}
+    \item \textbf{Metric 计算：} 对 Local Block 输出 $H_i$ 做梯度缩放后，经 metric 层得到合并度量：
+    \[
+        H_{metric} = H_i \cdot 0.1 + H_i^{detach} \cdot 0.9
+    \]
+    
+    \item \textbf{DTEM 合并操作：} 使用 DTEM 的 \texttt{\_merge\_train} 方法：
+    \begin{itemize}
+        \item 随机分组为 Source（Group A）和 Target（Group B）
+        \item 计算相似度，SoftTopK 生成转移矩阵 $T_{ab}$
+        \item Group B 吸收 Group A 的质量
+        \item 更新 Source Matrix 跟踪贡献来源
+    \end{itemize}
+    
+    \item \textbf{Source Trace 更新：} \texttt{matrix} 模式维护 source matrix，用于后续质心计算和 Perceiver-style 交叉注意力的 bias；\texttt{center} 模式只维护 no-grad center-of-mass，不构造 dense source matrix，也不提供 source-aware bias。需要注意，当前 CLS 分类训练路径尚未消费 \texttt{token\_center}，因此 \texttt{center} 脚本更准确地说是关闭 dense source/bias 的轻量下界，而不是完整 center-guided 版本。
+\end{enumerate}
+
+\subsection{Top-N 选择与 Perceiver 聚合}
+
+合并完成后，根据 token 质量 $v$ 选择质量最大的 $L_{trace} = N_p - M_{local} + 1 = 197$ 个 token（含 CLS），按质心排序后通过 Perceiver-style 交叉注意力生成进入 Latent Encoder 的序列。若 \texttt{source\_trace\_mode=matrix}，cross attention bias 由 $\log(S+\epsilon)$ 构造；若为 \texttt{center}，当前 CLS 分类路径实际不提供 source bias，并在无 source matrix 时退回按原索引排序。
+
+\subsection{Source Matrix 与 Global/Local 路径}
+
+当前代码区分四种 \texttt{source\_trace\_mode}：
+\begin{itemize}
+    \item \texttt{matrix}：维护完整 source matrix，并为 Perceiver-style cross attention 提供 source bias。
+    \item \texttt{detached}：同样维护 source matrix，但更新不进入反向图。
+    \item \texttt{center}：只维护 token 质心，不构造 dense source matrix。
+    \item \texttt{none}：完全关闭 trace 与 bias。
+\end{itemize}
+
+当 \texttt{dtem\_window\_size}>0 时，source matrix 使用带状存储，宽度为 $2\cdot W_{local}\cdot D_{local}+1$。当使用 global DTEM（\texttt{dtem\_window\_size=None/0}）且仍要语义正确维护 source matrix 时，宽度必须扩展为 $2L_{full}-1$，因为一次 global merge 可把任意位置的 source mass 转移到任意目标 token。此前“global 不需要维护 source matrix”的说法不准确：它只描述了旧代码跳过 trace 的行为，不是语义上正确的结论。
+
+%=============================================================================
+\section{Metric 梯度缩放机制}
+%=============================================================================
+
+\texttt{metric\_grad\_scale} $= 0.1$ 的作用是\textbf{限制合并决策对主干特征的梯度干扰}：
+
+\[
+    x_{metric} = x \cdot s + x^{detach} \cdot (1 - s), \quad s = 0.1
+\]
+
+前向传播时 $x_{metric} = x$（数值不变），但反向传播时只有 $10\%$ 的梯度从 metric 层回传到主干的 Transformer Block。这防止了合并度量的优化目标过度影响特征学习。
+
+%=============================================================================
+\section{验证与指标选择}
+%=============================================================================
+
+无论使用哪种训练策略，\textbf{验证阶段均使用完整的双分支前向}：
+\begin{itemize}
+    \item 调用 \texttt{model(input)} 时不传 \texttt{active\_branch} 参数。
+    \item \texttt{CLSDualBranchHybridToMeModel.forward} 默认 \texttt{active\_branch='both'}。
+    \item 验证指标基于 $\hat{y}_{fused}$（融合后的 logits），确保三种策略的评估标准一致。
+\end{itemize}
+
+%=============================================================================
+\section{三种策略对比总结}
+%=============================================================================
+
+\begin{table}[h]
+\centering
+\caption{三种双分支训练策略对比}
+\begin{tabular}{l c c c}
+\toprule
+\textbf{特性} & \textbf{T1 Joint} & \textbf{T2 Alternate} & \textbf{T3 Staged} \\
+\midrule
+每步前向分支数 & 2 & 1 & \makecell{阶段1: 1 \\ 阶段2: 2} \\
+每步显存 & $\approx 2\times$ & $\approx 1\times$ & \makecell{阶段1: $1\times$ \\ 阶段2: $2\times$} \\
+融合头参与训练 & 不直接（$\lambda_f=0$） & 不参与 & 阶段2不直接 \\
+分支 A 有效更新步数 & $200 \times |\text{loader}|$ & $\frac{200 \times |\text{loader}|}{2}$ & $200 \times |\text{loader}|$ \\
+分支 B 有效更新步数 & $200 \times |\text{loader}|$ & $\frac{200 \times |\text{loader}|}{2}$ & $100 \times |\text{loader}|$ \\
+分支 A 先收敛 & 否 & 否 & 是（阶段1） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{执行方式}
+%=============================================================================
+
+所有脚本均使用 \texttt{torchrun} 启动 8 GPU 分布式训练：
+
+\begin{verbatim}
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
+    --standalone --nproc_per_node 8 in1k_trainer.py [args]
+\end{verbatim}
+
+推荐执行顺序：
+\begin{enumerate}
+    \item 运行 \texttt{c100\_branch\_a\_deit\_aligned.sh}，获得分支 A 的 checkpoint。
+    \item 设置 \texttt{BRANCH\_A\_CKPT} 环境变量指向上一步的 best/last checkpoint。
+    \item 分别运行 T1/T2/T3 脚本进行对比实验：
+    \begin{verbatim}
+export BRANCH_A_CKPT=./work_dirs/.../best.pth.tar
+bash c100_dual_ab_t1_joint.sh
+bash c100_dual_ab_t2_alternate.sh
+bash c100_dual_ab_t3_staged.sh
+    \end{verbatim}
+\end{enumerate}
+
+\end{document}
