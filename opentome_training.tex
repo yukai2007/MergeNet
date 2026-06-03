@@ -29,7 +29,7 @@
 
 \begin{enumerate}
     \item \textbf{第一步（Branch A 单独训练）：} 训练一个无空间降采样的单分支模型，作为基线与后续双分支训练的初始化。
-    \item \textbf{第二步（Dual AB 双分支训练）：} 在分支 A 基础上引入带压缩能力的分支 B，通过 T1 Joint / T2 Alternate / T3 Staged 对照实验，以及当前推荐的 T4 EM-style Local/Latent 坐标训练，探索最优的双分支协同方式。
+    \item \textbf{第二步（Dual AB 双分支训练）：} 在分支 A 基础上引入带压缩能力的分支 B，通过 T1 Joint / T2 Alternate / T3 Staged 对照实验，以及当前推荐的 T4 Twin-EMA Local/Latent 互补冻结训练，探索最优的双分支协同方式。
 \end{enumerate}
 
 对应训练脚本：
@@ -38,7 +38,7 @@
     \item \texttt{c100\_dual\_ab\_t1\_joint.sh} — 第二步 T1：联合训练
     \item \texttt{c100\_dual\_ab\_t2\_alternate.sh} — 第二步 T2：交替训练
     \item \texttt{c100\_dual\_ab\_t3\_staged.sh} — 第二步 T3：分段训练
-    \item \texttt{trainer/classification/2000s2\_mergenet\_source\_matrix\_off\_robust.sh} — 第二步 T4：EM-style Local/Latent 坐标训练（当前推荐主线）
+    \item \texttt{trainer/classification/2000s2\_mergenet\_source\_matrix\_off\_twin\_ema.sh} — 第二步 T4：Twin-EMA Local/Latent 互补冻结训练（当前推荐主线）
 \end{itemize}
 
 %=============================================================================
@@ -473,47 +473,55 @@ Warm-start stage2 建议不要从 epoch 0 直接启用融合损失；当前 trai
 \end{itemize}
 
 %=============================================================================
-\section{T4：EM-style Local/Latent 坐标训练（推荐主线）}
+\section{T4：Twin-EMA Local/Latent 互补冻结训练（推荐主线）}
 %=============================================================================
 
 \subsection{核心判断}
 
-这里的 ``EM'' 不是 Exponential Moving Average，而是类似 EM / coordinate descent 的交替优化：固定一部分表征模块，训练另一部分表征模块。当前最稳妥的顺序是 \textbf{local-first}：
+这里的 EMA 是 Exponential Moving Average，但不是普通 timm 单模型 \texttt{model\_ema}。T4 同时维护两套同构 \texttt{dual\_ab} 模型，在同一个 batch 上并行训练，并让两套模型互相用 EMA 更新对方被冻结的模块：
 
 \begin{enumerate}
-    \item \textbf{Local phase：} 固定 Latent Encoder，训练 Local Encoder、DTEM metric/routing、分类头、fusion 和 cross-attention。
-    \item \textbf{Latent phase：} 固定 Local Encoder 与 DTEM metric/routing，训练 Latent Encoder、分类头、fusion 和 cross-attention。
+    \item \textbf{\texttt{local\_freeze} 模型：} 固定 \texttt{local} / DTEM 路由，只训练 latent、head、fusion、cross-attention 和 bridge。
+    \item \textbf{\texttt{latent\_freeze} 模型：} 固定 \texttt{latent}，只训练 local / DTEM 路由、head、fusion、cross-attention 和 bridge。
 \end{enumerate}
 
-采用 local-first 的原因是：Branch A 的强 checkpoint 来自无压缩路径，虽然能提供稳定分类特征，但没有真正训练 Branch B 的压缩路由。若一开始训练 latent，而 local/DTEM 路由仍不稳定，Latent Encoder 会适配一个持续漂移的压缩输入；相反，先固定 latent，让 local/DTEM 学会把压缩后的 token 送入稳定的 latent 空间，再让 latent 适配已经成形的压缩分布，训练条件更稳。
+每次 optimizer step 之后执行跨模型 EMA：
+\[
+    \theta^{L}_{local} \leftarrow
+    \alpha \theta^{L}_{local} + (1-\alpha)\theta^{Z}_{local}
+\]
+\[
+    \theta^{Z}_{latent} \leftarrow
+    \alpha \theta^{Z}_{latent} + (1-\alpha)\theta^{L}_{latent}
+\]
+其中 $L$ 表示 \texttt{local\_freeze} 模型，$Z$ 表示 \texttt{latent\_freeze} 模型，默认 $\alpha=0.999$。这样，被冻结的模块不是永久静止的，而是通过对方正在训练的对应模块获得平滑更新，避免 local 和 latent 在同一套模型内同时剧烈漂移。
 
-\subsection{参数分组}
+\subsection{两套模型的训练职责}
 
 \begin{table}[h]
 \centering
-\caption{T4 EM-style optimizer 参数分组}
+\caption{T4 Twin-EMA 两套模型职责}
 \begin{tabular}{l l l}
 \toprule
-\textbf{组别} & \textbf{参数范围} & \textbf{训练行为} \\
+\textbf{模型} & \textbf{冻结模块} & \textbf{直接梯度训练模块} \\
 \midrule
-\texttt{local} & \texttt{local.vit.blocks}, \texttt{local.metric\_layers} & 仅 Local phase 更新 \\
-\texttt{latent} & \texttt{latent} encoder 参数 & 仅 Latent phase 更新 \\
-\texttt{always} & patch/head/fusion/cross-attention/bridge 等其他参数 & 两个 phase 都更新 \\
+\texttt{local\_freeze} & \texttt{local} / DTEM & latent、head、fusion、cross-attention、bridge \\
+\texttt{latent\_freeze} & \texttt{latent} & local / DTEM、head、fusion、cross-attention、bridge \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-实现上，\texttt{in1k\_trainer.py} 会在 optimizer 创建后把单个参数组拆成上述三组，并通过每组的 \texttt{lr\_scale} 控制是否更新。冻结组的 \texttt{lr\_scale=0}，因此有效学习率为 $0$；已有的 gradient clipping 路径会跳过 \texttt{lr\_scale=0} 的参数，避免被冻结组的历史梯度干扰当前 phase 的全局范数。
+实现上，\texttt{in1k\_trainer.py} 在 warm-start 之后把基础模型复制成两套模型，分别设置 \texttt{requires\_grad=False}。优化器只更新各自未冻结的参数；EMA 传递通过 no-grad state update 完成，不参与反向传播。
 
 \subsection{推荐调度}
 
 当前推荐脚本为：
 
 \begin{verbatim}
-trainer/classification/2000s2_mergenet_source_matrix_off_robust.sh
+trainer/classification/2000s2_mergenet_source_matrix_off_twin_ema.sh
 \end{verbatim}
 
-默认调度为：
+默认配置为：
 
 \begin{table}[h]
 \centering
@@ -525,45 +533,24 @@ trainer/classification/2000s2_mergenet_source_matrix_off_robust.sh
 \texttt{branch\_a\_checkpoint} & \texttt{cifar100\_stage1\_1000e\_p8/model\_best.pth.tar} & 强 Branch A 初始化 \\
 \texttt{init\_copy\_head\_a\_to\_b} & \texttt{true} & 用 A 头初始化 B 头 \\
 \texttt{init\_fusion\_prefer\_a} & \texttt{true} & fusion 初始更偏向稳定 A 分支 \\
-\texttt{em\_local\_latent\_schedule} & \texttt{true} & 启用坐标训练 \\
-\texttt{em\_first\_phase} & \texttt{local} & 先训练 local/DTEM 路由 \\
-\texttt{em\_local\_epochs} & $10$ & 每轮 Local phase 长度 \\
-\texttt{em\_latent\_epochs} & $20$ & 每轮 Latent phase 长度 \\
-\texttt{fused\_loss\_start\_epoch} & $60$ & 两个完整 EM cycle 后再强化 fusion \\
+\texttt{twin\_ema\_local\_latent} & \texttt{true} & 启用双模型互补冻结 \\
+\texttt{twin\_ema\_decay} & $0.999$ & 跨模型 EMA 平滑系数 \\
+\texttt{twin\_ema\_update\_interval} & $1$ & 每个 optimizer step 同步一次 \\
+\texttt{batch\_size} & $25$ / GPU & 两套模型同时训练，默认降 batch 保显存 \\
+\texttt{fused\_loss\_start\_epoch} & $60$ & 先稳定两套模型，再强化 fusion \\
 \texttt{fused\_loss\_ramp\_epochs} & $30$ & 平滑引入 fusion CE，避免早期拉偏 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-对应的 phase 函数为：
-\[
-    \text{phase}(e) =
-    \begin{cases}
-        \text{local} & \text{if cycle 内落在前 } E_{local} \text{ 个 epoch} \\
-        \text{latent} & \text{otherwise}
-    \end{cases}
-\]
-其中 $E_{local}=10$，$E_{latent}=20$，cycle 长度为 $30$。Local phase 中：
-\[
-    \texttt{lr\_scale}_{local}=1,\quad
-    \texttt{lr\_scale}_{latent}=0,\quad
-    \texttt{lr\_scale}_{always}=1
-\]
-Latent phase 中：
-\[
-    \texttt{lr\_scale}_{local}=0,\quad
-    \texttt{lr\_scale}_{latent}=1,\quad
-    \texttt{lr\_scale}_{always}=1
-\]
-
 \subsection{正确性与边界}
 
 \begin{itemize}
-    \item \textbf{相比 T1 Joint：} T1 会让 local 路由与 latent 表征同时漂移，早期 Branch B 压缩路径容易学习不充分；T4 把两个难点拆开，降低相互干扰。
-    \item \textbf{相比 T2 Alternate：} 当前 Alternate 每步只走 A 或 B，fusion head 不参与训练；T4 始终使用 \texttt{active\_branch='both'} 的 joint 前向，fusion/head/cross-attention 作为 \texttt{always} 组持续更新。
-    \item \textbf{相比 T3 Staged：} 若已经有强 Branch A checkpoint，继续 A-only 阶段收益有限，反而推迟 Branch B 的压缩学习；T4 从第 0 个 epoch 就让 B 的 local/DTEM 路由进入有效训练。
-    \item \textbf{能保证的部分：} 每个核心模块都有非零学习率的训练窗口，local/DTEM、latent、head/fusion 都不会被遗漏；冻结窗口不会被 optimizer 的有效学习率更新。
-    \item \textbf{不能数学保证的部分：} 任何调度都不能保证每个模块 ``完全学好'' 或全局收敛。T4 的目标是消除当前实现中已知的不训练/互相拖拽问题，并给每个模块提供更干净、更稳定的学习信号。
+    \item \textbf{相比普通 EMA：} 普通 \texttt{model\_ema} 只平滑整模型权重；Twin-EMA 在训练过程中定向稳定 local/latent 的互相适配。
+    \item \textbf{相比单模型坐标冻结：} 单模型冻结会让被冻结模块完全静止；Twin-EMA 的冻结模块会从另一套模型的可训练对应模块获得平滑更新。
+    \item \textbf{相比 T2 Alternate：} T2 每步只走 A 或 B，fusion head 不参与训练；Twin-EMA 每套模型都保持 \texttt{active\_branch='both'}，fusion/head 持续训练。
+    \item \textbf{能保证的部分：} local/DTEM 和 latent 都有一套模型负责直接梯度学习，另一套模型通过 EMA 接收对应更新；不会出现某个核心部分完全不学习。
+    \item \textbf{不能数学保证的部分：} 该策略不能保证全局最优或“完全学好”，但它明确降低了 local 与 latent 同时剧烈漂移造成的不稳定。
 \end{itemize}
 
 %=============================================================================
@@ -663,20 +650,20 @@ Staged 的阶段 1（\texttt{epoch < dual\_stage\_b\_start\_epoch}）例外：�
 \end{tabular}
 \end{table}
 
-T4 不改变每步双分支 joint 前向，而是在 optimizer 层面做 local/latent 坐标冻结，因此它的显存接近 T1，但有效训练覆盖更清晰：
+T4 每步实际训练两套 \texttt{dual\_ab} 模型，因此显存和计算量高于 T1；默认脚本把 per-GPU batch size 从 $50$ 降到 $25$，优先保证训练可启动和稳定性：
 
 \begin{table}[h]
 \centering
 \caption{T4 推荐策略与前三种策略的关键区别}
 \begin{tabular}{l l}
 \toprule
-\textbf{维度} & \textbf{T4 EM-style Local/Latent} \\
+\textbf{维度} & \textbf{T4 Twin-EMA Local/Latent} \\
 \midrule
-每步前向 & 始终双分支 \texttt{active\_branch='both'} \\
-融合头训练 & 始终参与，fusion CE 延迟到第 $60$ epoch 后平滑引入 \\
-Local/DTEM 更新 & 每个 cycle 前 $10$ epoch 更新，Latent 冻结 \\
-Latent 更新 & 每个 cycle 后 $20$ epoch 更新，Local/DTEM 冻结 \\
-Always 组更新 & head、fusion、cross-attention、bridge 等每步更新 \\
+每步前向 & 两套模型均为双分支 \texttt{active\_branch='both'} \\
+融合头训练 & 两套模型都参与，fusion CE 延迟到第 $60$ epoch 后平滑引入 \\
+Local/DTEM 更新 & \texttt{latent\_freeze} 直接梯度训练，EMA 传给 \texttt{local\_freeze} \\
+Latent 更新 & \texttt{local\_freeze} 直接梯度训练，EMA 传给 \texttt{latent\_freeze} \\
+EMA 同步 & 默认每 step 一次，decay $=0.999$ \\
 推荐用途 & 当前主线训练；T1/T2/T3 保留为对照实验 \\
 \bottomrule
 \end{tabular}
@@ -700,7 +687,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
     \item 优先运行 T4 推荐脚本：
     \begin{verbatim}
 export BRANCH_A_CKPT=./work_dirs/.../best.pth.tar
-bash trainer/classification/2000s2_mergenet_source_matrix_off_robust.sh
+bash trainer/classification/2000s2_mergenet_source_matrix_off_twin_ema.sh
     \end{verbatim}
     \item 如需保留消融对照，再分别运行 T1/T2/T3 脚本：
     \begin{verbatim}
