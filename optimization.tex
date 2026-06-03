@@ -90,7 +90,7 @@ OpenToMe 视觉实现中已经将 source trace 明确拆成 \texttt{matrix}、\t
 \begin{itemize}
     \item local-window DTEM 的 source matrix 可以用带状相对位置存储，宽度为 $2\cdot W_{local}\cdot D_{local}+1$。
     \item global DTEM 若要语义正确维护 source matrix，不能沿用窄带存储，也不能跳过更新；它需要 $2L_{full}-1$ 的完整相对位置范围，并在 merge 时按 $a-b$ 的位置差平移 source mass。
-    \item \texttt{center} 模式只保留 no-grad 质心，能减少显存，但不等价于完整 source matrix，因为 Perceiver-style cross attention 不再获得 $\log S$ bias。当前 CLS 分类路径还未消费 \texttt{token\_center}，所以现有 off 脚本应解读为 dense source/bias off 下界；若要真正 center-guided，需要补 center-band bias 或至少用 center trace 排序。
+    \item \texttt{center} 模式只保留 no-grad 质心，能减少显存，但不等价于完整 source matrix，因为 Perceiver-style cross attention 不再获得 $\log S$ bias。当前 CLS 分类路径已经使用 \texttt{token\_center} 做排序；若要进一步增强，需要补 center-band bias。
 \end{itemize}
 
 \section*{系统层面：硬件适配与显存优化}

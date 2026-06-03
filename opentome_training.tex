@@ -29,15 +29,16 @@
 
 \begin{enumerate}
     \item \textbf{第一步（Branch A 单独训练）：} 训练一个无空间降采样的单分支模型，作为基线与后续双分支训练的初始化。
-    \item \textbf{第二步（Dual AB 双分支训练）：} 在分支 A 基础上引入带压缩能力的分支 B，通过三种训练策略（T1 Joint / T2 Alternate / T3 Staged）探索最优的双分支协同方式。
+    \item \textbf{第二步（Dual AB 双分支训练）：} 在分支 A 基础上引入带压缩能力的分支 B，通过 T1 Joint / T2 Alternate / T3 Staged 对照实验，以及当前推荐的 T4 EM-style Local/Latent 坐标训练，探索最优的双分支协同方式。
 \end{enumerate}
 
-对应四个训练脚本：
+对应训练脚本：
 \begin{itemize}
     \item \texttt{c100\_branch\_a\_deit\_aligned.sh} — 第一步：单分支 A 基线
     \item \texttt{c100\_dual\_ab\_t1\_joint.sh} — 第二步 T1：联合训练
     \item \texttt{c100\_dual\_ab\_t2\_alternate.sh} — 第二步 T2：交替训练
     \item \texttt{c100\_dual\_ab\_t3\_staged.sh} — 第二步 T3：分段训练
+    \item \texttt{trainer/classification/2000s2\_mergenet\_source\_matrix\_off\_robust.sh} — 第二步 T4：EM-style Local/Latent 坐标训练（当前推荐主线）
 \end{itemize}
 
 %=============================================================================
@@ -305,10 +306,11 @@ Token 合并 & 不合并 & \textbf{执行 DTEM 合并} \\
 \subsection{损失分析}
 
 \[
-    \mathcal{L}_{T1} = \underbrace{\text{CE}(\hat{y}_A, \tilde{y})}_{\text{分支 A 监督}} + \lambda_B \cdot \underbrace{\text{CE}(\hat{y}_B, \tilde{y})}_{\text{分支 B 监督}} + \lambda_f \cdot \underbrace{\text{CE}(\hat{y}_{fused}, \tilde{y})}_{\text{融合监督（默认禁用）}}
+    \mathcal{L}_{T1} = \underbrace{\text{CE}(\hat{y}_A, \tilde{y})}_{\text{分支 A 监督}} + \lambda_B \cdot \underbrace{\text{CE}(\hat{y}_B, \tilde{y})}_{\text{分支 B 监督}} + \lambda_f \cdot \underbrace{\text{CE}(\hat{y}_{fused}, \tilde{y})}_{\text{融合监督（当前 stage2 启用）}}
 \]
 
 当 $\lambda_B=1.0$, $\lambda_f=0.2$ 时，两个分支受到等权重的独立监督，融合头也获得较弱的直接监督。若 $\lambda_f=0$，融合头仅通过验证/推理路径使用而不直接参与训练损失。
+Warm-start stage2 建议不要从 epoch 0 直接启用融合损失；当前 trainer 支持 \texttt{dual\_fused\_loss\_start\_epoch} 与 \texttt{dual\_fused\_loss\_ramp\_epochs}，先让 \texttt{branch\_b.head} 在冻结共享层时稳定，再逐步训练 fusion head，避免 fusion 过早吸收未稳定的 B 分支 logits。
 
 \subsection{特点}
 
@@ -471,6 +473,100 @@ Token 合并 & 不合并 & \textbf{执行 DTEM 合并} \\
 \end{itemize}
 
 %=============================================================================
+\section{T4：EM-style Local/Latent 坐标训练（推荐主线）}
+%=============================================================================
+
+\subsection{核心判断}
+
+这里的 ``EM'' 不是 Exponential Moving Average，而是类似 EM / coordinate descent 的交替优化：固定一部分表征模块，训练另一部分表征模块。当前最稳妥的顺序是 \textbf{local-first}：
+
+\begin{enumerate}
+    \item \textbf{Local phase：} 固定 Latent Encoder，训练 Local Encoder、DTEM metric/routing、分类头、fusion 和 cross-attention。
+    \item \textbf{Latent phase：} 固定 Local Encoder 与 DTEM metric/routing，训练 Latent Encoder、分类头、fusion 和 cross-attention。
+\end{enumerate}
+
+采用 local-first 的原因是：Branch A 的强 checkpoint 来自无压缩路径，虽然能提供稳定分类特征，但没有真正训练 Branch B 的压缩路由。若一开始训练 latent，而 local/DTEM 路由仍不稳定，Latent Encoder 会适配一个持续漂移的压缩输入；相反，先固定 latent，让 local/DTEM 学会把压缩后的 token 送入稳定的 latent 空间，再让 latent 适配已经成形的压缩分布，训练条件更稳。
+
+\subsection{参数分组}
+
+\begin{table}[h]
+\centering
+\caption{T4 EM-style optimizer 参数分组}
+\begin{tabular}{l l l}
+\toprule
+\textbf{组别} & \textbf{参数范围} & \textbf{训练行为} \\
+\midrule
+\texttt{local} & \texttt{local.vit.blocks}, \texttt{local.metric\_layers} & 仅 Local phase 更新 \\
+\texttt{latent} & \texttt{latent} encoder 参数 & 仅 Latent phase 更新 \\
+\texttt{always} & patch/head/fusion/cross-attention/bridge 等其他参数 & 两个 phase 都更新 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+实现上，\texttt{in1k\_trainer.py} 会在 optimizer 创建后把单个参数组拆成上述三组，并通过每组的 \texttt{lr\_scale} 控制是否更新。冻结组的 \texttt{lr\_scale=0}，因此有效学习率为 $0$；已有的 gradient clipping 路径会跳过 \texttt{lr\_scale=0} 的参数，避免被冻结组的历史梯度干扰当前 phase 的全局范数。
+
+\subsection{推荐调度}
+
+当前推荐脚本为：
+
+\begin{verbatim}
+trainer/classification/2000s2_mergenet_source_matrix_off_robust.sh
+\end{verbatim}
+
+默认调度为：
+
+\begin{table}[h]
+\centering
+\caption{T4 推荐默认超参}
+\begin{tabular}{l l l}
+\toprule
+\textbf{参数} & \textbf{值} & \textbf{说明} \\
+\midrule
+\texttt{branch\_a\_checkpoint} & \texttt{cifar100\_stage1\_1000e\_p8/model\_best.pth.tar} & 强 Branch A 初始化 \\
+\texttt{init\_copy\_head\_a\_to\_b} & \texttt{true} & 用 A 头初始化 B 头 \\
+\texttt{init\_fusion\_prefer\_a} & \texttt{true} & fusion 初始更偏向稳定 A 分支 \\
+\texttt{em\_local\_latent\_schedule} & \texttt{true} & 启用坐标训练 \\
+\texttt{em\_first\_phase} & \texttt{local} & 先训练 local/DTEM 路由 \\
+\texttt{em\_local\_epochs} & $10$ & 每轮 Local phase 长度 \\
+\texttt{em\_latent\_epochs} & $20$ & 每轮 Latent phase 长度 \\
+\texttt{fused\_loss\_start\_epoch} & $60$ & 两个完整 EM cycle 后再强化 fusion \\
+\texttt{fused\_loss\_ramp\_epochs} & $30$ & 平滑引入 fusion CE，避免早期拉偏 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+对应的 phase 函数为：
+\[
+    \text{phase}(e) =
+    \begin{cases}
+        \text{local} & \text{if cycle 内落在前 } E_{local} \text{ 个 epoch} \\
+        \text{latent} & \text{otherwise}
+    \end{cases}
+\]
+其中 $E_{local}=10$，$E_{latent}=20$，cycle 长度为 $30$。Local phase 中：
+\[
+    \texttt{lr\_scale}_{local}=1,\quad
+    \texttt{lr\_scale}_{latent}=0,\quad
+    \texttt{lr\_scale}_{always}=1
+\]
+Latent phase 中：
+\[
+    \texttt{lr\_scale}_{local}=0,\quad
+    \texttt{lr\_scale}_{latent}=1,\quad
+    \texttt{lr\_scale}_{always}=1
+\]
+
+\subsection{正确性与边界}
+
+\begin{itemize}
+    \item \textbf{相比 T1 Joint：} T1 会让 local 路由与 latent 表征同时漂移，早期 Branch B 压缩路径容易学习不充分；T4 把两个难点拆开，降低相互干扰。
+    \item \textbf{相比 T2 Alternate：} 当前 Alternate 每步只走 A 或 B，fusion head 不参与训练；T4 始终使用 \texttt{active\_branch='both'} 的 joint 前向，fusion/head/cross-attention 作为 \texttt{always} 组持续更新。
+    \item \textbf{相比 T3 Staged：} 若已经有强 Branch A checkpoint，继续 A-only 阶段收益有限，反而推迟 Branch B 的压缩学习；T4 从第 0 个 epoch 就让 B 的 local/DTEM 路由进入有效训练。
+    \item \textbf{能保证的部分：} 每个核心模块都有非零学习率的训练窗口，local/DTEM、latent、head/fusion 都不会被遗漏；冻结窗口不会被 optimizer 的有效学习率更新。
+    \item \textbf{不能数学保证的部分：} 任何调度都不能保证每个模块 ``完全学好'' 或全局收敛。T4 的目标是消除当前实现中已知的不训练/互相拖拽问题，并给每个模块提供更干净、更稳定的学习信号。
+\end{itemize}
+
+%=============================================================================
 \section{分支 B 的 Token 合并详解}
 %=============================================================================
 
@@ -503,12 +599,12 @@ Token 合并 & 不合并 & \textbf{执行 DTEM 合并} \\
         \item 更新 Source Matrix 跟踪贡献来源
     \end{itemize}
     
-    \item \textbf{Source Trace 更新：} \texttt{matrix} 模式维护 source matrix，用于后续质心计算和 Perceiver-style 交叉注意力的 bias；\texttt{center} 模式只维护 no-grad center-of-mass，不构造 dense source matrix，也不提供 source-aware bias。需要注意，当前 CLS 分类训练路径尚未消费 \texttt{token\_center}，因此 \texttt{center} 脚本更准确地说是关闭 dense source/bias 的轻量下界，而不是完整 center-guided 版本。
+    \item \textbf{Source Trace 更新：} \texttt{matrix} 模式维护 source matrix，用于后续质心计算和 Perceiver-style 交叉注意力的 bias；\texttt{center} 模式只维护 no-grad center-of-mass，不构造 dense source matrix，也不提供 source-aware bias。当前 CLS 分类训练路径已消费 \texttt{token\_center} 做 top-k 排序，因此 \texttt{center} 脚本是“center 排序 + dense source/bias off”的轻量路径。
 \end{enumerate}
 
 \subsection{Top-N 选择与 Perceiver 聚合}
 
-合并完成后，根据 token 质量 $v$ 选择质量最大的 $L_{trace} = N_p - M_{local} + 1 = 197$ 个 token（含 CLS），按质心排序后通过 Perceiver-style 交叉注意力生成进入 Latent Encoder 的序列。若 \texttt{source\_trace\_mode=matrix}，cross attention bias 由 $\log(S+\epsilon)$ 构造；若为 \texttt{center}，当前 CLS 分类路径实际不提供 source bias，并在无 source matrix 时退回按原索引排序。
+合并完成后，根据 token 质量 $v$ 选择质量最大的 $L_{trace} = N_p - M_{local} + 1 = 197$ 个 token（含 CLS），按质心排序后通过 Perceiver-style 交叉注意力生成进入 Latent Encoder 的序列。若 \texttt{source\_trace\_mode=matrix}，cross attention bias 由 $\log(S+\epsilon)$ 构造；若为 \texttt{center}，排序使用 \texttt{token\_center}，但 cross attention source bias 仍为零。
 
 \subsection{Source Matrix 与 Global/Local 路径}
 
@@ -538,30 +634,50 @@ Token 合并 & 不合并 & \textbf{执行 DTEM 合并} \\
 \section{验证与指标选择}
 %=============================================================================
 
-无论使用哪种训练策略，\textbf{验证阶段均使用完整的双分支前向}：
+Joint / Alternate / T4 以及 Staged 的阶段 2，\textbf{验证阶段使用完整的双分支前向}：
 \begin{itemize}
     \item 调用 \texttt{model(input)} 时不传 \texttt{active\_branch} 参数。
     \item \texttt{CLSDualBranchHybridToMeModel.forward} 默认 \texttt{active\_branch='both'}。
-    \item 验证指标基于 $\hat{y}_{fused}$（融合后的 logits），确保三种策略的评估标准一致。
+    \item 验证指标基于 $\hat{y}_{fused}$（融合后的 logits），确保这些策略的评估标准一致。
 \end{itemize}
+Staged 的阶段 1（\texttt{epoch < dual\_stage\_b\_start\_epoch}）例外：此时 B 分支尚未训练，\texttt{in1k\_trainer.py} 会用 \texttt{active\_branch='a'} 验证，以避免随机 B 分支和 fusion head 污染早期 checkpoint 选择。Local DTEM 在 eval 下使用确定性交错 A/B 分组，训练阶段仍保留随机分组。
 
 %=============================================================================
-\section{三种策略对比总结}
+\section{四种策略对比总结}
 %=============================================================================
 
 \begin{table}[h]
 \centering
-\caption{三种双分支训练策略对比}
+\caption{前三种双分支训练策略对比}
 \begin{tabular}{l c c c}
 \toprule
 \textbf{特性} & \textbf{T1 Joint} & \textbf{T2 Alternate} & \textbf{T3 Staged} \\
 \midrule
 每步前向分支数 & 2 & 1 & \makecell{阶段1: 1 \\ 阶段2: 2} \\
 每步显存 & $\approx 2\times$ & $\approx 1\times$ & \makecell{阶段1: $1\times$ \\ 阶段2: $2\times$} \\
-融合头参与训练 & 不直接（$\lambda_f=0$） & 不参与 & 阶段2不直接 \\
+融合头参与训练 & 是（当前 $\lambda_f=0.2$） & 不参与 & 阶段2可参与（取决于 $\lambda_f$） \\
 分支 A 有效更新步数 & $200 \times |\text{loader}|$ & $\frac{200 \times |\text{loader}|}{2}$ & $200 \times |\text{loader}|$ \\
 分支 B 有效更新步数 & $200 \times |\text{loader}|$ & $\frac{200 \times |\text{loader}|}{2}$ & $100 \times |\text{loader}|$ \\
 分支 A 先收敛 & 否 & 否 & 是（阶段1） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+T4 不改变每步双分支 joint 前向，而是在 optimizer 层面做 local/latent 坐标冻结，因此它的显存接近 T1，但有效训练覆盖更清晰：
+
+\begin{table}[h]
+\centering
+\caption{T4 推荐策略与前三种策略的关键区别}
+\begin{tabular}{l l}
+\toprule
+\textbf{维度} & \textbf{T4 EM-style Local/Latent} \\
+\midrule
+每步前向 & 始终双分支 \texttt{active\_branch='both'} \\
+融合头训练 & 始终参与，fusion CE 延迟到第 $60$ epoch 后平滑引入 \\
+Local/DTEM 更新 & 每个 cycle 前 $10$ epoch 更新，Latent 冻结 \\
+Latent 更新 & 每个 cycle 后 $20$ epoch 更新，Local/DTEM 冻结 \\
+Always 组更新 & head、fusion、cross-attention、bridge 等每步更新 \\
+推荐用途 & 当前主线训练；T1/T2/T3 保留为对照实验 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -570,7 +686,7 @@ Token 合并 & 不合并 & \textbf{执行 DTEM 合并} \\
 \section{执行方式}
 %=============================================================================
 
-所有脚本均使用 \texttt{torchrun} 启动 8 GPU 分布式训练：
+当前 \texttt{1000s2}/\texttt{2000s2} 系列脚本默认使用 \texttt{torchrun} 启动 4 GPU 分布式训练；旧脚本可能仍保留 8 GPU 配置：
 
 \begin{verbatim}
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
@@ -581,7 +697,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
 \begin{enumerate}
     \item 运行 \texttt{c100\_branch\_a\_deit\_aligned.sh}，获得分支 A 的 checkpoint。
     \item 设置 \texttt{BRANCH\_A\_CKPT} 环境变量指向上一步的 best/last checkpoint。
-    \item 分别运行 T1/T2/T3 脚本进行对比实验：
+    \item 优先运行 T4 推荐脚本：
+    \begin{verbatim}
+export BRANCH_A_CKPT=./work_dirs/.../best.pth.tar
+bash trainer/classification/2000s2_mergenet_source_matrix_off_robust.sh
+    \end{verbatim}
+    \item 如需保留消融对照，再分别运行 T1/T2/T3 脚本：
     \begin{verbatim}
 export BRANCH_A_CKPT=./work_dirs/.../best.pth.tar
 bash c100_dual_ab_t1_joint.sh

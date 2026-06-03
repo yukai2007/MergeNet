@@ -150,7 +150,7 @@ $\mathcal{Q}$ & Inference Queue & $(B, W_{infer}, d)$ & 推理时的潜在语义
         &K, V = H_{\#LoT} \\
         &Bias_{i,j} = \log(S_{\#LoT}[k_i, j] + \epsilon)
     \end{align}
-    这个 source-aware bias 只对应完整 source matrix 路径；若采用轻量 center trace，则没有该项 source bias。OpenToMe 当前 CLS 分类路径还未消费 \texttt{token\_center}，因此 center 模式在该路径中应视作 dense source/bias off 的下界。
+    这个 source-aware bias 只对应完整 source matrix 路径；若采用轻量 center trace，则没有该项 source bias。OpenToMe 当前 CLS 分类路径会消费 \texttt{token\_center} 做排序，但 center 模式仍应视作 dense source/bias off 的轻量路径。
     
     \item \textbf{Operation:}
         $Z = \text{Softmax}\left(\frac{Q_{down}K^{T}}{\sqrt{d}} + Bias\right)V\in \mathbb{R}^{N \times d}$

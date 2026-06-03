@@ -12,10 +12,10 @@
 | --- | --- | --- |
 | `matrix` | 维护完整 source matrix，cross attention 使用 `log(source)` 作为 additive bias | 语义最完整的参考路径 |
 | `detached` | 维护完整 source matrix，但更新在 `torch.no_grad()` 下执行 | 检查反向图与显存的影响 |
-| `center` | LocalEncoder 内维护 token center-of-mass，不构造 dense source matrix | 当前轻量默认路径 |
+| `center` | LocalEncoder 内维护 token center-of-mass，不构造 dense source matrix；CLS 路径用该 center 做 top-k 排序，cross-attention source bias 为零 | 当前轻量默认路径 |
 | `none` | 不维护 source trace / source bias | 下界对照 |
 
-关键区别：`center` 不是 `matrix` 的语义等价替代。它不提供 Perceiver-style cross attention 的 source-aware bias；在当前 CLS 分类训练路径中，`token_center` 也尚未被 `CLSHybridToMeModel.forward()` 消费，所以 `center` 消融更准确地解释为“关闭 dense source matrix / source bias 的轻量下界”，而不是完整的 center-guided source trace。
+关键区别：`center` 不是 `matrix` 的语义等价替代。它现在会在 CLS 分类路径中被消费，用于 top-k token 的 center-of-mass 排序；但它不提供 Perceiver-style cross attention 的 source-aware bias，因此仍是“关闭 dense source matrix / source bias”的轻量路径，而不是完整 source matrix 指导。
 
 ### 1.2 global source matrix 正确维护
 
@@ -40,16 +40,27 @@ target_k = source_k + delta
 
 然后 scatter-add 到 B 的 source 分布中。这个修正只会在 global DTEM 路径触发；正常超参脚本若显式设置 `branch_b_dtem_window_size=8`，走的是 local-window 窄带路径。
 
-### 1.3 每次 forward 重置 `token_center`
+### 1.3 每次 forward 重置 trace 状态
 
 `LocalEncoder.forward()` 每次开始时会重置：
 
 ```python
 self._tome_info["source_matrix"] = None
 self._tome_info["token_center"] = None
+self._tome_info.pop("source_matrix_center", None)
+self._tome_info.pop("source_matrix_width", None)
 ```
 
-否则 `center` 模式在连续 batch 间可能复用上一次 forward 的 center trace 状态。
+否则 `center` 模式在连续 batch 间可能复用上一次 forward 的 center trace 状态；source-matrix-off 模式也可能残留旧的 source metadata。
+
+### 1.4 eval 阶段确定性分组
+
+`DTEMBlock._merge_train()` 中的 Group A / Group B 划分现在按 `self.training` 区分：
+
+- train：继续使用随机分组，保留原来的 merge 正则化效果。
+- eval：使用确定性的交错分组，避免同一个 validation batch 每次 forward 产生不同 merge 结果。
+
+这个修正不改变训练阶段的数据流，但会让验证指标与 `model_best.pth.tar` 选择可复现。修复前，同一输入在 `model.eval()` 下连续两次跑 Branch B，logits 可出现约 `0.197` 的最大绝对差；修复后为 `0.0`。
 
 ## 2. 当前实现的真实架构行为
 
@@ -79,7 +90,7 @@ topk_x length = 196 + CLS = 197
 `CLSHybridToMeModel.forward()` 中：
 
 1. 用 token size 选择 top-k token。
-2. 在 `matrix` 路径用 source center-of-mass 对 top-k token 排序；当前 CLS 路径在 `center` 模式下没有消费 `token_center`，会退回原索引排序。
+2. 在 `matrix` 路径用 source matrix 计算 center-of-mass 排序；在 `center` 路径直接使用 `token_center` 排序。
 3. 构造 `topk_x` 作为 query。
 4. 用 full local tokens `x_embed` 作为 key/value。
 5. 执行：
@@ -94,7 +105,7 @@ x_trace = encode_cross_attention(topk_x, x_embed, mask=bias) + topk_x
 bias[i, j] = log(source_i[j] + eps)
 ```
 
-当 `source_trace_mode=center` 或 `none` 时，当前实现不会提供这个 source-aware bias，而是使用零 bias。因此如果论文叙事强调“word 从 byte level 获得语义时受 source matrix 指导”，严格对应的是 `matrix/detached` 路径，而不是当前 CLS 训练使用的 `center` 路径。
+当 `source_trace_mode=center` 或 `none` 时，当前实现不会提供这个 source-aware bias，而是使用零 bias。因此如果论文叙事强调“word 从 byte level 获得语义时受 source matrix 指导”，严格对应的是 `matrix/detached` 路径；`center` 只提供排序指导。
 
 ### 2.3 Dual AB 共享范围
 
@@ -133,7 +144,7 @@ OFF: --source_trace_mode center, GPUs 4,5,6,7
 --branch_b_dtem_window_size 8
 ```
 
-所以它们验证的是“正常 local-window 超参下 dense source matrix / source bias on/off”，不是 global source matrix 消融，也不是完整 center-guided 消融。
+所以它们验证的是“正常 local-window 超参下 dense source matrix / source bias on/off”，不是 global source matrix 消融。2026-05-31 后，OFF 脚本的行为会改变：它仍完全不构造 source matrix，但会真正使用 center trace 做 top-k 排序。为避免覆盖旧结果，脚本默认实验名前缀改成 `srcmatrix_off_v2_center`。
 
 ## 4. 实际训练核验
 
@@ -149,6 +160,7 @@ OFF: --source_trace_mode center, GPUs 4,5,6,7
 - 开关确实生效，显存差距很明显。
 - throughput 差距小于单分支 synthetic efficiency bench，是因为 2k 训练是 dual AB joint：Branch A、LocalBlock、cross attention、fusion、loss、数据增强和 dataloader 都进入总耗时。
 - 不能用这两个脚本判断 global source matrix 的成本；global 需要去掉或置零 `branch_b_dtem_window_size`。
+- 旧 OFF 结果来自修复前路径，当时 CLS forward 没有消费 `token_center`；修复后重跑会影响 `/liziqing/yukai/OpenToMe/trainer/classification/2000s2_mergenet_source_matrix_off_4567.sh`，ON 脚本不受影响。
 
 ## 5. 文档表述需要保持的边界
 
@@ -156,6 +168,6 @@ OFF: --source_trace_mode center, GPUs 4,5,6,7
 
 1. local-window source matrix 是带状存储，宽度为 `2 * window_size * local_depth + 1`。
 2. global source matrix 若要语义正确，需要完整相对位置范围，宽度为 `2N - 1`；不能再说“不需要 source matrix”。
-3. 当前 CLS 训练里的 `center` 模式只是 dense source/bias off 的轻量下界；若要真正使用 center trace，还需让 `CLSHybridToMeModel.forward()` 消费 `token_center` 来排序或构造 center-band bias。
+3. 当前 CLS 训练里的 `center` 模式已经消费 `token_center` 做排序，但仍没有 source bias；若要进一步增强，需要构造 center-band bias。
 4. 当前训练实现是 soft merge + top-k selection，不是每层物理删除 token。
 5. 视觉版 OpenToMe 的 CIFAR100 正常脚本使用 patch size 8，所以 patch 数是 784，不是 patch size 16 下的 196。
