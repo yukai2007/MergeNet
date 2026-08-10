@@ -1,0 +1,84 @@
+# Recommended ImageNet scale-up candidate, transferred from the CIFAR-100
+# efficiency winner. ImageNet accuracy is not yet established.
+# Paths, run name, batch size, accumulation, and resume are launcher-owned.
+dataset: ""
+train_split: train
+val_split: val
+num_classes: 1000
+
+model: mergenet_small_cls
+pretrained: false
+img_size: 224
+patch_size: 8
+local_depth: 4
+latent_depth: 8
+lambda_local: 4.0
+lambda_start: 2.0
+lambda_ramp_start_epoch: 0
+lambda_ramp_epochs: 50
+total_merge_latent: 0
+dtem_window_size: 8
+dtem_feat_dim: 64
+dtem_r: 2
+dtem_t: 1
+dtem_train_grouping: random_per_sample
+dtem_train_grouping_seed: 0
+dtem_eval_grouping: alternating_per_layer_fast
+dtem_eval_grouping_seed: 0
+use_softkmax: true
+metric_grad_scale: 0.1
+source_trace_mode: center
+swa_size: 256
+local_block_window: 32
+local_cls_global: true
+soft_topk: true
+soft_topk_aux_weight: 0.05
+soft_topk_aux_start_epoch: 20
+soft_topk_aux_ramp_epochs: 20
+drop_rate: 0.0
+attn_drop_rate: 0.0
+drop_path_rate: 0.1
+
+batch_size: 64
+validation_batch_size: 64
+epochs: 300
+opt: adamw
+opt_eps: 1.0e-8
+lr: 5.0e-4
+weight_decay: 0.05
+clip_grad: 1.0
+clip_mode: norm
+sched: cosine
+min_lr: 1.0e-5
+warmup_epochs: 5
+warmup_lr: 1.0e-6
+cooldown_epochs: 0
+
+mixup: 0.8
+cutmix: 1.0
+mixup_prob: 1.0
+mixup_switch_prob: 0.5
+mixup_mode: batch
+smoothing: 0.1
+aa: rand-m9-mstd0.5-inc1
+color_jitter: 0.4
+reprob: 0.25
+remode: pixel
+recount: 1
+train_interpolation: bicubic
+crop_pct: 0.9
+
+amp: true
+no_prefetcher: true
+model_ema: true
+model_ema_decay: 0.99996
+find_unused_parameters: "false"
+update_freq: 1
+workers: 8
+pin_mem: true
+worker_seeding: all
+seed: 42
+log_interval: 50
+recovery_interval: 1000
+checkpoint_hist: 3
+eval_metric: top1

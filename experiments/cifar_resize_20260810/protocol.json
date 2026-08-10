@@ -1,0 +1,242 @@
+{
+  "schema_version": "mergenet.cifar_resize_protocol.v1",
+  "campaign_id": "cifar_resize_20260810_delivery_validation",
+  "question": "在 CIFAR-100 不同输入分辨率下，交付态 MergeNet 是否相对同宽 DeiT-S/8 同时获得可复现的准确率与训练效率收益？",
+  "expected_environment": {
+    "python": "3.10",
+    "torch": "2.6.0+cu124",
+    "torchvision": "0.21.0+cu124",
+    "timm": "0.9.11",
+    "flash_attn": "2.7.4.post1"
+  },
+  "expected_runtime_env": {
+    "OPENTOME_MERGENET_IMPL": "new",
+    "TIMM_FUSED_ATTN": "1"
+  },
+  "resizes": [
+    {"size": 160, "micro_batch": 200, "update_freq": 1, "effective_global_batch": 200},
+    {"size": 192, "micro_batch": 200, "update_freq": 1, "effective_global_batch": 200},
+    {"size": 224, "micro_batch": 200, "update_freq": 1, "effective_global_batch": 200},
+    {"size": 256, "micro_batch": 100, "update_freq": 2, "effective_global_batch": 200},
+    {"size": 320, "micro_batch": 50, "update_freq": 4, "effective_global_batch": 200}
+  ],
+  "models": [
+    {
+      "id": "deit_s8",
+      "label": "DeiT-S/8 baseline",
+      "kind": "baseline",
+      "geometry": {
+        "model": "deit_small_patch16_224",
+        "patch_size": 8,
+        "depth": 12,
+        "embed_dim": 384,
+        "num_heads": 6
+      }
+    },
+    {
+      "id": "mn_l2",
+      "label": "MergeNet 6+6 lambda=2 w16",
+      "kind": "mergenet",
+      "geometry": {
+        "model": "mergenet_small_cls",
+        "patch_size": 8,
+        "local_depth": 6,
+        "latent_depth": 6,
+        "lambda_start": 2.0,
+        "lambda_local": 2.0,
+        "local_block_window": 16,
+        "dtem_window_size": 8
+      }
+    },
+    {
+      "id": "mn_l4",
+      "label": "MergeNet 4+8 lambda=4 w32",
+      "kind": "mergenet",
+      "geometry": {
+        "model": "mergenet_small_cls",
+        "patch_size": 8,
+        "local_depth": 4,
+        "latent_depth": 8,
+        "lambda_start": 2.0,
+        "lambda_local": 4.0,
+        "local_block_window": 32,
+        "dtem_window_size": 8
+      }
+    }
+  ],
+  "seeds": [42, 43, 44],
+  "training": {
+    "dataset": "CIFAR100",
+    "dataset_download": false,
+    "num_classes": 100,
+    "initialization": "scratch",
+    "knowledge_distillation": false,
+    "epochs": 200,
+    "target_epoch": 199,
+    "global_batch": 200,
+    "optimizer": "adamw",
+    "optimizer_eps": 1e-8,
+    "optimizer_betas": [0.9, 0.999],
+    "learning_rate": 0.001,
+    "weight_decay": 0.05,
+    "scheduler": "cosine",
+    "minimum_learning_rate": 0.0001,
+    "warmup_epochs": 20,
+    "warmup_learning_rate": 0.000001,
+    "cooldown_epochs": 0,
+    "clip_grad_norm": 1.0,
+    "clip_mode": "norm",
+    "drop_rate": 0.0,
+    "attention_drop_rate": 0.0,
+    "drop_path_rate": 0.1,
+    "mixup": 0.8,
+    "cutmix": 1.0,
+    "mixup_mode": "batch",
+    "mixup_probability": 1.0,
+    "mixup_switch_probability": 0.5,
+    "label_smoothing": 0.1,
+    "auto_augment": "rand-m9-mstd0.5-inc1",
+    "color_jitter": 0.4,
+    "random_resized_crop_scale": [0.08, 1.0],
+    "random_resized_crop_ratio": [0.75, 1.3333333333333333],
+    "horizontal_flip_probability": 0.5,
+    "vertical_flip_probability": 0.0,
+    "random_erasing_probability": 0.25,
+    "random_erasing_mode": "pixel",
+    "random_erasing_count": 1,
+    "train_interpolation": "random",
+    "validation_crop_pct": 0.9,
+    "amp": "fp16",
+    "model_ema": true,
+    "model_ema_decay": 0.9998,
+    "pin_memory": true,
+    "prefetcher": false,
+    "workers": 8,
+    "worker_seeding": "all",
+    "log_interval": 50,
+    "recovery_interval": 0,
+    "checkpoint_history": 3,
+    "eval_metric": "top1",
+    "find_unused_parameters": "false",
+    "distillation": {
+      "logit_weight": 0.0,
+      "logit_temperature": 2.0,
+      "routing_weight": 0.0,
+      "routing_temperature": 1.0,
+      "feature_weight": 0.0,
+      "feature_token_weight": 0.0,
+      "teacher_checkpoint": ""
+    },
+    "primary_accuracy": "epoch_199_ema_top1",
+    "appendix_accuracy": "best_ema_top1_over_epochs",
+    "mergenet": {
+      "train_grouping": "random_per_sample",
+      "train_grouping_seed": 0,
+      "eval_grouping": "alternating_per_layer_fast",
+      "eval_grouping_seed": 0,
+      "dtem_feat_dim": 64,
+      "dtem_r": 2,
+      "dtem_t": 1,
+      "metric_grad_scale": 0.1,
+      "source_trace_mode": "center",
+      "total_merge_latent": 0,
+      "use_softkmax": true,
+      "swa_size": 256,
+      "local_cls_global": true,
+      "lambda_ramp_start_epoch": 0,
+      "lambda_ramp_epochs": 50,
+      "soft_topk": true,
+      "soft_topk_aux_weight": 0.05,
+      "soft_topk_aux_start_epoch": 20,
+      "soft_topk_aux_ramp_epochs": 20
+    }
+  },
+  "efficiency": {
+    "dataset_path_used": false,
+    "input": "synthetic_fp32_tensor_with_fp16_autocast",
+    "batch_size": 32,
+    "warmup": 20,
+    "steps": 100,
+    "replicates": "complete matrix independently on each physical GPU",
+    "required_gpu_count": 8,
+    "amp": "fp16",
+    "train_mode": "random_per_sample",
+    "mandatory_scope": "target-lambda synthetic model-only steady-state forward/backward/optimizer-step microbenchmark",
+    "not_measured_by_mandatory_gate": "200-epoch end-to-end wall-clock average; MN accuracy uses a 50-epoch lambda curriculum",
+    "inference_modes": ["alternating_per_layer", "alternating_per_layer_fast"],
+    "parity_atol": 0.02,
+    "parity_rtol": 0.02,
+    "idle_consecutive_checks": 2,
+    "idle_check_interval_sec": 10,
+    "min_free_mib": 70000,
+    "max_idle_util_pct": 5,
+    "max_load1_per_cpu": 1.5,
+    "host_quality_policy": "timed item 的 start/end 均须满足 load1/process_affinity_cpu_count <= 1.5；超阈值结果保留但 timing_valid=false 并重测；logits parity 豁免。",
+    "reported_metrics": [
+      "throughput_img_s",
+      "latency_ms_per_batch",
+      "peak_allocated_mib",
+      "peak_reserved_mib",
+      "parameter_count"
+    ]
+  },
+  "decision_rules": {
+    "scope": "preregistered; evaluate every condition separately at both listed resizes",
+    "lambda4": {
+      "candidate_model": "mn_l4",
+      "baseline_model": "deit_s8",
+      "required_complete_seeds": 3,
+      "required_gpu_count": 8,
+      "conditions": [
+        {
+          "metric": "paired_accuracy_delta_pp",
+          "mode": "epoch_199_ema_top1 paired by seed",
+          "op": ">",
+          "threshold": 0.0,
+          "resizes": [256, 320]
+        },
+        {
+          "metric": "train_throughput_ratio",
+          "mode": "target-lambda synthetic model-only steady-state random_per_sample step; candidate/baseline; mean±sample-SD over all 8 GPU replicates",
+          "op": ">=",
+          "threshold": 1.0,
+          "resizes": [256, 320]
+        },
+        {
+          "metric": "train_peak_allocated_ratio",
+          "mode": "target-lambda synthetic model-only steady-state random_per_sample step; candidate/baseline; mean±sample-SD over all 8 GPU replicates",
+          "op": "<",
+          "threshold": 1.0,
+          "resizes": [256, 320]
+        }
+      ]
+    },
+    "inference": {
+      "required_for_pass": false,
+      "policy": "报告 generic、fast、两者 logits parity 与显存；不用于 lambda4 总 PASS 判定"
+    },
+    "other_resizes_and_lambda2": {
+      "required_for_pass": false,
+      "policy": "160/192/224 与 mn_l2 给出逐 seed/逐卡结果、mean ± sample SD 和 Pareto 图，仅作机制/趋势解释；不声称95%置信区间"
+    },
+    "overall_pass": "只有 mn_l4 在 256 和 320 上分别满足三项 mandatory conditions，且 3 个 accuracy seeds 与 8 张卡效率复现实验均完整，才判定有效。"
+  },
+  "post_training_release_gate": {
+    "blocks_campaign_launch": false,
+    "required_for_final_release": true,
+    "scope": "30 个 MergeNet epoch-199 EMA checkpoints（2 MN models × 5 resizes × 3 seeds）",
+    "dataset": "CIFAR-100 test 10000 images",
+    "protocol": "同一 checkpoint、同一完整 deterministic loader 分别运行 alternating_per_layer 与 alternating_per_layer_fast",
+    "record": ["generic_top1", "fast_top1", "top1_delta_pp", "argmax_mismatch_count", "max_abs_logit_diff", "mean_abs_logit_diff"],
+    "per_run_condition": "abs(top1_delta_pp) <= 0.05（最多 5/10000；top-1 分辨率 0.01pp）",
+    "failure_policy": "任一 run 失败则 release NO-GO；mandatory 性能 gate 数值仍原样报告，不得删除或改写"
+  },
+  "evidence_boundaries": {
+    "historical_screening": "历史 generic-eval seed42 resize 结果只用于筛选候选，不与本轮统计合并。",
+    "delivery_validation": "本轮准确率使用交付态 alternating_per_layer_fast 评估；训练仍为 random_per_sample。",
+    "token_reduction": "token reduction 不能替代实测吞吐、延迟或显存。",
+    "selection": "epoch 199 EMA 是主指标；best EMA 只能放附录，不参与 PASS。",
+    "microbenchmark": "mandatory efficiency 是 target-lambda synthetic model-only steady-state step，不是 MN 带前50e lambda curriculum 的200e端到端 wall-clock 均值；summary.csv 实际 train/eval throughput/memory 只作补充并分开命名。",
+    "uncertainty": "预注册汇总为 mean ± sample SD 并保留逐 seed/逐卡值，不声称95%置信区间。"
+  }
+}

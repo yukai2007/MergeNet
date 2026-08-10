@@ -1,0 +1,35 @@
+# Training outputs and local data
+/outputs/
+/work_dirs/
+/data/
+/logs/
+
+# Model and recovery artifacts
+*.pth
+*.pt
+*.ckpt
+*.pth.tar
+*.safetensors
+
+# Runtime logs and trackers
+*.log
+wandb/
+runs/
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Local environments and editors
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+*.swp
+.DS_Store

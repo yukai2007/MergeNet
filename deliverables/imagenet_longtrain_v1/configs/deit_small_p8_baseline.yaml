@@ -1,0 +1,58 @@
+# Matched ImageNet-1K baseline: DeiT-S at 224x224 with patch size 8.
+# Paths, run name, batch size, accumulation, and resume are launcher-owned.
+dataset: ""
+train_split: train
+val_split: val
+num_classes: 1000
+
+model: deit_small_patch16_224
+pretrained: false
+img_size: 224
+patch_size: 8
+drop_rate: 0.0
+attn_drop_rate: 0.0
+drop_path_rate: 0.1
+
+batch_size: 64
+validation_batch_size: 64
+epochs: 300
+opt: adamw
+opt_eps: 1.0e-8
+lr: 5.0e-4
+weight_decay: 0.05
+clip_grad: 1.0
+clip_mode: norm
+sched: cosine
+min_lr: 1.0e-5
+warmup_epochs: 5
+warmup_lr: 1.0e-6
+cooldown_epochs: 0
+
+mixup: 0.8
+cutmix: 1.0
+mixup_prob: 1.0
+mixup_switch_prob: 0.5
+mixup_mode: batch
+smoothing: 0.1
+aa: rand-m9-mstd0.5-inc1
+color_jitter: 0.4
+reprob: 0.25
+remode: pixel
+recount: 1
+train_interpolation: bicubic
+crop_pct: 0.9
+
+amp: true
+no_prefetcher: true
+model_ema: true
+model_ema_decay: 0.99996
+find_unused_parameters: "false"
+update_freq: 1
+workers: 8
+pin_mem: true
+worker_seeding: all
+seed: 42
+log_interval: 50
+recovery_interval: 1000
+checkpoint_hist: 3
+eval_metric: top1

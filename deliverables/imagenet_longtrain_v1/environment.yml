@@ -1,0 +1,9 @@
+name: mergenet-in1k
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10.16
+  - pip=25.0.1
+  - setuptools=75.8.0
+  - wheel=0.45.1
+  - ninja=1.11.1

@@ -1,0 +1,1811 @@
+# ------ jinxin modified ------ #
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import contextlib
+from timm.layers import Mlp, DropPath, use_fused_attn
+from timm.models.vision_transformer import VisionTransformer, LayerScale
+from timm.models.vision_transformer import Attention as TimmAttention
+from timm.models.vision_transformer import Block as TimmBlock
+from opentome.utils.thetopk import ThreTopK
+from functools import partial
+
+from opentome.tome.tome import (
+    bipartite_soft_matching,
+    merge_source_matrix,
+    merge_source_map,
+    merge_wavg,
+    parse_r,
+)
+from opentome.timm import Attention, Block
+from opentome.timm.bias_local_attn import biased_local_attention
+
+
+DTEM_EVAL_GROUPING_MODES = (
+    "alternating",
+    "alternating_per_layer",
+    "alternating_per_layer_fast",
+    "seeded",
+)
+
+DTEM_TRAIN_GROUPING_MODES = (
+    "random_per_sample",
+    *DTEM_EVAL_GROUPING_MODES,
+)
+
+
+def build_dtem_eval_group_indices(
+    n_tokens,
+    batch_size,
+    device,
+    mode="alternating_per_layer",
+    seed=0,
+    layer_index=0,
+):
+    """Build deterministic donor/receiver groups for DTEM evaluation.
+
+    ``alternating`` keeps the same donor parity at every layer. On an even-width
+    row-major patch grid this can create a strong stripe prior in accumulated
+    token mass, so it is retained only for checkpoint diagnosis.
+
+    ``alternating_per_layer`` is the default deterministic inference policy and
+    swaps the donor parity on odd local layers. ``alternating_per_layer_fast``
+    builds the exact same partition, but lets the merge implementation use a
+    strided slice/interleave path instead of the generic sort/gather/restore
+    path. It changes no learned parameter and is intended for checkpoint-
+    compatible efficiency probes.
+    ``seeded`` uses a fixed pseudo-random permutation that changes by local
+    layer. The same permutation is shared across the batch so the prediction of
+    an example does not depend on its batch slot. The permutation is generated
+    on CPU to make the grouping independent of the CUDA device in use.
+
+    Historical training still draws an independent random partition for every
+    sample and local layer. Explicit deterministic training protocols reuse
+    this helper so their train/eval partition is exactly identical.
+    """
+    n_tokens = int(n_tokens)
+    batch_size = int(batch_size)
+    layer_index = int(layer_index)
+    if n_tokens < 0:
+        raise ValueError(f"n_tokens must be non-negative, got {n_tokens}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if mode not in DTEM_EVAL_GROUPING_MODES:
+        raise ValueError(
+            f"Unsupported DTEM eval grouping {mode!r}; "
+            f"expected one of {DTEM_EVAL_GROUPING_MODES}"
+        )
+
+    base_idx = torch.arange(n_tokens, device=device, dtype=torch.long)
+    if mode == "alternating":
+        permutation = torch.cat([base_idx[1::2], base_idx[0::2]], dim=0)
+    elif mode in ("alternating_per_layer", "alternating_per_layer_fast"):
+        if layer_index % 2:
+            permutation = torch.cat([base_idx[0::2], base_idx[1::2]], dim=0)
+        else:
+            permutation = torch.cat([base_idx[1::2], base_idx[0::2]], dim=0)
+    else:
+        # Use a large odd stride so adjacent layers do not reuse a nearby RNG
+        # state. Modulo keeps manual_seed in its documented signed-64-bit range.
+        mixed_seed = (int(seed) + 1_000_003 * layer_index) % (2**63 - 1)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(mixed_seed)
+        permutation = torch.randperm(
+            n_tokens, generator=generator, device="cpu"
+        ).to(device=device)
+
+    n_donors = n_tokens // 2
+    donor_idx = permutation[:n_donors].unsqueeze(0).expand(batch_size, -1)
+    receiver_idx = permutation[n_donors:].unsqueeze(0).expand(batch_size, -1)
+    return donor_idx, receiver_idx
+
+
+# ---------------------- dtem 专用通用 map/trace 工具 ---------------------- #
+# def merge_source_map_for_dtem(current_level_map, source_map):
+#     if source_map is None:
+#         return current_level_map
+#     return torch.gather(current_level_map, dim=1, index=source_map)
+
+@torch.no_grad()
+def trace_token_merge(x, size, token_map):
+    """
+    将 token_map 所指定的分组进行加权聚合，返回合并后的 x/size 以及压缩后的映射：
+    - x: [B, L, C]
+    - size: [B, L] 或 [B, L, 1] 或 None（None 表示等权重）
+    - token_map: [B, L]，每个原 token 合并到的目标 group 索引
+    返回 (x_merged [B, M_max, C], size_merged [B, M_max, 1], compact_token_map [B, L])
+    """
+    B, L, C = x.shape
+    device = x.device
+    dtype = x.dtype
+
+    if size is None:
+        size_local = torch.ones(B, L, device=device, dtype=dtype)
+    else:
+        size_local = size.squeeze(-1) if size.ndim == 3 else size
+
+    offset = torch.arange(B, device=device, dtype=torch.long).view(B, 1) * L
+    global_token_map = token_map + offset
+
+    unique_global_indices, inverse_indices = torch.unique(global_token_map.flatten(), return_inverse=True)
+    batch_indices = torch.div(unique_global_indices, L, rounding_mode='floor')
+
+    perm = torch.argsort(unique_global_indices)
+    sorted_batch_indices = batch_indices[perm]
+    is_new_batch = torch.cat([torch.tensor([True], device=device), sorted_batch_indices[1:] != sorted_batch_indices[:-1]])
+    batch_group_ids = torch.cumsum(is_new_batch.long(), dim=0) - 1
+    segment_starts = torch.where(is_new_batch)[0]
+    local_rank_sorted = torch.arange(len(unique_global_indices), device=device) - segment_starts[batch_group_ids]
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(len(unique_global_indices), device=device)
+    local_rank_unsorted = local_rank_sorted[inv_perm]
+    compact_token_map = local_rank_unsorted[inverse_indices].view(B, L)
+
+    counts_per_batch = torch.bincount(batch_indices, minlength=B)
+    M_max = counts_per_batch.max().item()
+
+    index = compact_token_map.unsqueeze(-1).expand_as(x)
+    x_w = x * size_local.unsqueeze(-1)
+
+    num = torch.zeros(B, M_max, C, device=device, dtype=dtype)
+    den = torch.zeros(B, M_max, device=device, dtype=dtype)
+
+    num.scatter_add_(dim=1, index=index, src=x_w)
+    den.scatter_add_(dim=1, index=compact_token_map, src=size_local)
+
+    den_clamped = torch.clamp(den, min=torch.finfo(den.dtype).eps)
+    x_merged = num / den_clamped.unsqueeze(-1)
+    size_merged = den.unsqueeze(-1)
+
+    return x_merged, size_merged, compact_token_map
+
+
+def token_unmerge_from_map_for_dtem(merged_tokens, token_map_compact, T_full):
+    """
+    将长度 L-k 的 merged_tokens 还原到原长度 L：
+    - merged_tokens: [B, L-k, C]
+    - token_map_compact: [B, L]，每个原 token 在合并后序列中的位置
+    - T_full: 原长度 L
+    返回: [B, L, C]
+    """
+    B, Lk, C = merged_tokens.shape
+    device = merged_tokens.device
+    b_idx = torch.arange(B, device=device)[:, None].expand(B, T_full)
+    return merged_tokens[b_idx, token_map_compact]
+
+
+class DTEMLinear(nn.Linear):
+    def __init__(self, qkv_layer, feat_dim):
+        super().__init__(in_features=qkv_layer.weight.shape[1], out_features=qkv_layer.weight.shape[0] + feat_dim, bias=True)
+        # qkv
+        self.qkv_layer = qkv_layer
+
+        # metric
+        self.feat_dim = feat_dim
+        self.metric_layer = nn.Linear(qkv_layer.weight.shape[-1], feat_dim)
+
+        # During training, we use qkv_layer and metric_layer directly
+        # So the inherited weight/bias are only used in eval mode
+        # Set them to not require gradients to avoid DDP unused parameter issues
+        self.weight.requires_grad = False
+        self.bias.requires_grad = False
+
+        # copy
+        self.update()
+
+    @torch.no_grad()
+    def update(self):
+        # Ensure weights are on the same device
+        device = self.qkv_layer.weight.device
+
+        # Move metric_layer to the same device as qkv_layer
+        if self.metric_layer.weight.device != device:
+            self.metric_layer = self.metric_layer.to(device)
+
+        if self.weight.device != device:
+            self.weight.data = self.weight.data.to(device)
+            self.bias.data = self.bias.data.to(device)
+
+        # qkv -> self
+        self.weight.data[:-self.feat_dim].copy_(self.qkv_layer.weight.data)
+        self.bias.data[:-self.feat_dim].copy_(self.qkv_layer.bias.data)
+
+        # metric_layer -> self
+        self.weight.data[-self.feat_dim:].copy_(self.metric_layer.weight.data)
+        self.bias.data[-self.feat_dim:].copy_(self.metric_layer.bias.data)
+
+    def train(self, mode=True):
+        if mode is False:   # if eval
+            self.update()
+        return super().train(mode)
+
+    def forward(self, input: torch.Tensor):
+        if not self.training:
+            # Ensure weights are on the same device as input
+            if self.weight.device != input.device:
+                self.update()
+            out = F.linear(input, self.weight, self.bias)
+            return out[..., :-self.feat_dim], out[..., -self.feat_dim:]
+
+        # training
+        # Ensure metric_layer is on the same device as input
+        if self.metric_layer.weight.device != input.device:
+            self.metric_layer = self.metric_layer.to(input.device)
+
+        out1 = self.qkv_layer(input)  # Shape: (B, N, 3 * num_heads * head_dim)
+        # Allow 10% gradient to flow through metric for end-to-end optimization
+        metric_input = input * 0.1 + input.detach() * 0.9
+        out2 = self.metric_layer(metric_input)  # Shape: (B, N, feat_dim)
+        return out1, out2
+
+# pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except Exception:
+    FLASH_ATTN_AVAILABLE = False
+
+
+"""
+    timm - deit patch
+"""
+class DTEMAttention(Attention):
+    def patch(self, feat_dim):
+        if feat_dim is not None:
+            out_dim = feat_dim
+        else:
+            dim = self.head_dim * self.num_heads
+            out_dim = self.head_dim if dim < 1024 else 2 * self.head_dim
+        # add metric_layer
+        self.qkv = DTEMLinear(self.qkv, out_dim)
+
+    def forward(self, x, size=None):    # x:(B, N, C), size:(B, N) or (B, N, 1)
+        B, N, C = x.shape
+        out1, out2 = self.qkv(x)
+        qkv = out1.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)     # B, H, N, head_dim
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        window_size = self._tome_info.get("swa_size")
+        if window_size is None:
+            window_size = self._tome_info.get("window_size")
+        if window_size is not None and window_size > 0:
+            if not FLASH_ATTN_AVAILABLE:
+                raise RuntimeError(
+                    "DTEM local attention requires flash-attn. "
+                    "Please install flash-attn or set dtem_window_size=None."
+                )
+            if size is None:
+                raise RuntimeError(
+                    "DTEM local attention requires size for bias. "
+                    "Got size=None while local window is enabled."
+                )
+            size_log = size.squeeze(-1) if size.ndim == 3 else size
+            size_log = size_log.float().clamp_min(1e-6).log()
+
+            x_out = biased_local_attention(
+                q, k, v,
+                bias=size_log,
+                local_window=window_size,
+                dropout_p=self.attn_drop.p,
+                training=self.training,
+                x_dtype=x.dtype,
+                input_layout="BHND",
+            )
+            x_bnc = x_out.transpose(1, 2).reshape(B, N, self.num_heads * self.head_dim)
+        else:
+            # Compute softmax in fp32 for numerical stability, keep everything else in AMP dtype
+            # The FlashAttention helper applies this same scale internally.
+            # Keep q unscaled at the call boundary so both branches apply
+            # head_dim**-0.5 exactly once.
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            if size is None or (not self._tome_info["r"]):
+                attn = attn.float().softmax(dim=-1).to(v.dtype)
+            else:
+                attn_f = attn.float()
+                _attn = attn_f - torch.max(attn_f, dim=-1, keepdim=True)[0]
+                size_ = size if size is not None else torch.ones(B, N, 1, device=x.device, dtype=torch.float32)
+                _attn = _attn.exp_() * size_[:, None, None, :, 0].float()
+                attn_f = _attn / _attn.sum(dim=-1, keepdim=True)
+                attn = attn_f.to(v.dtype)
+            attn = self.attn_drop(attn)
+            x_bnc = (attn @ v).permute(0, 2, 1, 3).contiguous().view(B, N, self.num_heads * self.head_dim)
+
+        x = x_bnc
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        metric = dict(
+            q = q,
+            k = k,
+            v = v,
+            x = x,
+            metric = out2
+        )
+        return x, metric
+
+    def _naive_local_attention(self, q, k, v, size, window_size, x_dtype=torch.float32):
+        """
+        无依赖的局部窗口注意力参考实现（不在主路径中使用）。
+        q,k,v: (B, H, N, D)
+        size: (B, N, 1) or (B, N) or None
+        返回: (B, N, C)
+        """
+        B, H, N, D = q.shape
+        BH = B * H
+
+        q_flat = q.transpose(1, 2).reshape(BH, N, D)
+        k_flat = k.transpose(1, 2).reshape(BH, N, D)
+        v_flat = v.transpose(1, 2).reshape(BH, N, D)
+
+        padded_k = F.pad(k_flat, (0, 0, window_size, window_size))
+        padded_v = F.pad(v_flat, (0, 0, window_size, window_size))
+
+        k_windows = padded_k.unfold(dimension=1, size=2 * window_size + 1, step=1)  # (BH, N, win, D)
+        v_windows = padded_v.unfold(dimension=1, size=2 * window_size + 1, step=1)  # (BH, N, win, D)
+        k_windows = k_windows.transpose(-1, -2)
+        v_windows = v_windows.transpose(-1, -2)
+        q_reshaped = q_flat.unsqueeze(2)  # (BH, N, 1, D)
+        attn = (q_reshaped @ k_windows.transpose(-1, -2)).squeeze(2) * self.scale  # (BH, N, win)
+
+        if size is not None:
+            size_log = size.log().squeeze(-1) if size.ndim == 3 else size.log()
+            size_bias_bh = size_log.unsqueeze(1).expand(-1, H, -1).reshape(BH, N)
+            padded_size_bias = F.pad(size_bias_bh, (window_size, window_size), mode='constant', value=-1e9)
+            size_bias_windows = padded_size_bias.unfold(dimension=1, size=2 * window_size + 1, step=1)
+            attn = attn + size_bias_windows
+
+        win_indices = torch.arange(-window_size, window_size + 1, device=q.device).view(1, -1)
+        q_indices = torch.arange(N, device=q.device).view(-1, 1)
+        abs_k_pos = q_indices + win_indices  # (N, win)
+        mask = (abs_k_pos >= 0) & (abs_k_pos < N)
+        attn = attn.masked_fill(~mask.unsqueeze(0), float('-inf'))
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        attn_out_flat = (attn.unsqueeze(2) @ v_windows).squeeze(2)  # (BH, N, D)
+        attn_out = attn_out_flat.view(B, H, N, D).transpose(1, 2)  # (B, N, H, D)
+        x_processed = attn_out.reshape(B, N, H * D).to(x_dtype)
+        return x_processed
+
+
+
+
+class DTEMBlock(Block):
+
+    def _select(self, k, a, b, a_orig_idx=None, b_orig_idx=None):
+        """
+        统一的选择逻辑：支持全局或局部窗口匹配，并支持跨层屏蔽。
+        a: (B, Na, C), b: (B, Nb, C)
+        a_orig_idx: (B, Na) - a tokens 的原始位置索引
+        b_orig_idx: (B, Nb) - b tokens 的原始位置索引
+        返回 assign:
+            - 全局模式 (window_size <= 0): (B, Na, Nb)
+            - 局部窗口模式 (window_size > 0): (B, Na, 2*window_size+1) 狭长矩阵
+        """
+        EPSILON = torch.finfo(torch.float32).eps
+        B, Na, C = a.shape
+        _, Nb, _ = b.shape
+        device = a.device
+
+        window_size = self._tome_info.get("window_size")
+        if window_size is None or window_size <= 0:
+            scores = a @ b.transpose(-1, -2)
+            _idx = scores.argsort(dim=-1, descending=True)
+            _x = scores.gather(dim=-1, index=_idx)
+            _x = _x / (self._tome_info.get("tau1", 1.0))
+            if self._tome_info.get("use_softkmax")==False:
+                khot = torch.zeros_like(_x)
+                _x_iter = _x.clone()  # Clone to avoid inplace modification
+                for _ in range(k):
+                    onehot_approx = F.softmax(_x_iter.view(B, -1) * self._tome_info.get("tau2", 30.0), dim=-1).view(B, Na, Nb)
+                    khot += onehot_approx
+                    khot_mask = torch.clamp(1 - onehot_approx.sum(dim=-1, keepdim=True), min=EPSILON)
+                    _x_iter = _x_iter + torch.log(khot_mask)
+            else:
+                _x_energy = torch.logsumexp(_x, dim=-1).exp()
+                row_khot = ThreTopK(_x_energy, k, self._tome_info["tau2"])
+                khot = F.softmax(_x, dim=-1) * row_khot.unsqueeze(-1)
+
+            tmp = torch.clamp(khot.sum(dim=-1, keepdim=True).detach() - 1, min=0.) + 1.
+            nkhot = khot / tmp
+            nkhot = nkhot.to(scores.dtype)
+            assign = torch.zeros_like(scores).scatter_reduce(-1, _idx, nkhot, reduce='sum')
+        else:
+            # 某些情况下 Na 与 Nb 可能相差 1（例如边界填充后 unfold），先对齐长度避免广播错误
+            if Na != Nb:
+                new_len = min(Na, Nb)
+                a = a[:, :new_len, :]
+                b = b[:, :new_len, :]
+                if a_orig_idx is not None:
+                    a_orig_idx = a_orig_idx[:, :new_len]
+                if b_orig_idx is not None:
+                    b_orig_idx = b_orig_idx[:, :new_len]
+                Na = Nb = new_len
+
+            padded_b = F.pad(b, (0, 0, window_size, window_size))
+            b_windows_unfolded = padded_b.unfold(dimension=1, size=2 * window_size + 1, step=1)
+            b_windows = b_windows_unfolded.permute(0, 1, 3, 2)
+            a_reshaped = a.unsqueeze(2)
+            local_scores = (a_reshaped * b_windows).sum(dim=-1) / (self._tome_info.get("tau1", 1.0))
+
+            # Mask out invalid positions (outside [0, Nb) range)
+            a_indices = torch.arange(Na, device=device).view(1, -1, 1)
+            window_offsets = torch.arange(-window_size, window_size + 1, device=device).view(1, 1, -1)
+            b_indices = a_indices + window_offsets
+            valid_mask = (b_indices >= 0) & (b_indices < Nb)
+            neg_inf = torch.finfo(local_scores.dtype).min
+            local_scores = local_scores.masked_fill(~valid_mask, neg_inf)
+
+            if self._tome_info.get("use_softkmax")==False:
+                khot = torch.zeros_like(local_scores)
+                local_scores_iter = local_scores.clone()  # Clone to avoid inplace modification
+                for _ in range(k):
+                    onehot_approx = F.softmax(local_scores_iter * self._tome_info.get("tau2", 30.0), dim=-1)
+                    khot += onehot_approx
+                    khot_mask = torch.clamp(1 - onehot_approx.sum(dim=-1, keepdim=True), min=EPSILON)
+                    local_scores_iter = local_scores_iter + torch.log(khot_mask)
+            else:
+                local_scores_energy = torch.logsumexp(local_scores, dim=-1).exp()
+                row_khot = ThreTopK(local_scores_energy, k, self._tome_info["tau2"])
+                khot = F.softmax(local_scores, dim=-1) * row_khot.unsqueeze(-1)
+
+            tmp = torch.clamp(khot.sum(dim=-1, keepdim=True).detach() - 1, min=0.) + 1.
+            nkhot = khot / tmp
+
+            # Keep assign as narrow matrix (B, Na, 2*window_size+1) for local window
+            # Store b_indices to map window positions to actual b token indices
+            a_indices = torch.arange(Na, device=device).view(1, -1, 1)
+            window_offsets = torch.arange(-window_size, window_size + 1, device=device).view(1, 1, -1)
+            b_indices = a_indices + window_offsets  # (1, Na, 2*window_size+1)
+            valid_mask = (b_indices >= 0) & (b_indices < Nb)  # (1, Na, 2*window_size+1)
+
+            # assign stays as narrow matrix with masked values
+            assign = torch.where(valid_mask.expand(B, -1, -1), nkhot, 0.0)  # (B, Na, 2*window_size+1)
+
+            # Store b_indices for later use in merging
+            self._tome_info['assign_b_indices'] = b_indices  # (1, Na, 2*window_size+1)
+            self._tome_info['assign_valid_mask'] = valid_mask  # (1, Na, 2*window_size+1)
+
+            # Store original indices for physical locality check
+            self._tome_info['assign_a_orig_idx'] = a_orig_idx  # (B, Na) or None
+            self._tome_info['assign_b_orig_idx'] = b_orig_idx  # (B, Nb) or None
+        # These diagnostics are not consumed by MergeNet. Each ``.item()``
+        # forces a device synchronization, so keep them behind an explicit
+        # compatibility flag instead of stalling every local layer.
+        if self._tome_info.get("collect_merge_stats", True):
+            with torch.no_grad():
+                out_dict = {
+                    'num': (nkhot if 'nkhot' in locals() else khot).sum().item(),
+                    'max': (khot if 'khot' in locals() else nkhot).view(B, -1).max(dim=-1)[0].sum().item(),
+                }
+        else:
+            out_dict = None
+        return assign, out_dict
+
+    def _merge_train(self, x, size, r, n, metric, source_matrix=None):
+
+        metric = metric['metric']
+        norm = metric.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        metric = metric / norm
+
+        r = min(r, (n - 1) // 2)
+        if r <= 0:
+            return x, size, n, metric, source_matrix
+
+        # 保证 size 为 [B, N, 1]
+        if size is not None and size.ndim == 2:
+            size = size.unsqueeze(-1)
+
+        source_trace_mode = self._tome_info.get("source_trace_mode", None)
+        if source_trace_mode is None:
+            trace_source = self._tome_info.get("trace_source", True)
+            source_tracking_mode = self._tome_info.get("source_tracking_mode", "none")
+            source_trace_mode = "matrix" if trace_source and source_tracking_mode == "matrix" else "none"
+        if source_trace_mode not in ("matrix", "detached", "center", "none"):
+            raise ValueError(f"Unsupported source_trace_mode: {source_trace_mode!r}")
+        use_source_matrix = source_trace_mode in ("matrix", "detached")
+        if not use_source_matrix:
+            source_matrix = None
+
+        # Initialize source_matrix only for modes that need full source
+        # distributions. "center" and "none" avoid this dense trace entirely.
+        if source_matrix is None and use_source_matrix:
+            B, N = x.shape[0], x.shape[1]
+            window_size = self._tome_info.get("window_size", 0)
+            local_depth = self._tome_info.get("local_depth", 1)
+            if window_size is not None and window_size > 0:
+                width = 2 * window_size * local_depth + 1
+                center = window_size * local_depth
+            else:
+                # Global matching can move source mass between any two token
+                # positions in one layer, so the exact relative trace must cover
+                # the whole sequence rather than the local-window radius.
+                width = 2 * N - 1
+                center = N - 1
+
+            source_matrix = torch.zeros(B, N, width, device=x.device, dtype=x.dtype)
+            source_matrix[:, :, center] = 1.0  # Identity: each token 100% from itself
+            # Store metadata only, not the matrix itself
+            self._tome_info["source_matrix_center"] = center
+            self._tome_info["source_matrix_width"] = width
+
+        # xa, xb = x[..., 1:n:2, :], x[..., 2:n:2, :]
+        # a, b = metric[..., 1:n:2, :], metric[..., 2:n:2, :]
+        # wa = size[..., 1:n:2, 0]
+        # wb = size[..., 2:n:2, 0]
+
+        # Select donor/receiver groups according to the train/eval policy.
+        # =================================================================================== #
+        B, T, C = x.shape
+        device = x.device
+
+        # Random grouping: split tokens (excluding cls if present) into two groups
+        has_cls = self._tome_info.get("class_token", True)
+        if has_cls:
+            n_tokens = n - 1  # exclude cls token at position 0
+            offset = 1
+        else:
+            n_tokens = n
+            offset = 0
+
+        Na = n_tokens // 2
+        Nb = n_tokens - Na
+
+        # ``random_per_sample`` is the historical training behavior and remains
+        # the default. Deterministic training modes deliberately reuse the eval
+        # helper so an explicitly matched train/inference protocol cannot drift
+        # through two separate grouping implementations.
+        use_strided_fast_path = False
+        donor_patch_parity = None
+        if (
+            self.training
+            and self._tome_info.get("train_grouping", "random_per_sample")
+            == "random_per_sample"
+        ):
+            rand_vals = torch.rand(B, n_tokens, device=device)
+            rand_perm = torch.argsort(rand_vals, dim=1)  # [B, n_tokens]
+            a_idx = rand_perm[:, :Na] + offset  # +offset to skip cls if present
+            b_idx = rand_perm[:, Na:] + offset
+        else:
+            if self.training:
+                grouping = self._tome_info.get(
+                    "train_grouping", "random_per_sample"
+                )
+                grouping_seed = self._tome_info.get(
+                    "train_grouping_seed", 0
+                )
+                if grouping == "random_per_sample":
+                    raise RuntimeError(
+                        "random_per_sample must use the stochastic training branch"
+                    )
+            else:
+                grouping = self._tome_info.get(
+                    "eval_grouping", "alternating_per_layer"
+                )
+                grouping_seed = self._tome_info.get(
+                    "eval_grouping_seed", 0
+                )
+            merge_layer_index = self._tome_info.get("merge_layer_index", 0)
+            a_idx, b_idx = build_dtem_eval_group_indices(
+                n_tokens=n_tokens,
+                batch_size=B,
+                device=device,
+                mode=grouping,
+                seed=grouping_seed,
+                layer_index=merge_layer_index,
+            )
+            a_idx = a_idx + offset
+            b_idx = b_idx + offset
+
+            # The fast policy is mathematically identical to
+            # ``alternating_per_layer``. Restrict it to the even-token,
+            # no-dense-source case so the specialized interleave below remains
+            # simple and auditable; all other geometries use the generic path.
+            use_strided_fast_path = (
+                grouping == "alternating_per_layer_fast"
+                and n_tokens % 2 == 0
+                and source_matrix is None
+            )
+            if use_strided_fast_path:
+                donor_patch_parity = 0 if merge_layer_index % 2 else 1
+
+        if use_strided_fast_path:
+            # Both parity groups are already monotonically increasing.
+            a_idx_sorted = a_idx
+            b_idx_sorted = b_idx
+        else:
+            # Sort indices within each group for efficient gathering.
+            a_idx_sorted, _ = torch.sort(a_idx, dim=1)
+            b_idx_sorted, _ = torch.sort(b_idx, dim=1)
+
+        # Extract tokens using sorted indices
+        # Note: x and metric have different feature dimensions
+        D_metric = metric.shape[-1]
+
+        if use_strided_fast_path:
+            active_end = offset + n_tokens
+            receiver_patch_parity = 1 - donor_patch_parity
+            donor_slice = slice(
+                offset + donor_patch_parity, active_end, 2
+            )
+            receiver_slice = slice(
+                offset + receiver_patch_parity, active_end, 2
+            )
+            # ``contiguous`` preserves the layout produced by gather, while
+            # avoiding index expansion and four gather kernels.
+            xa = x[:, donor_slice, :].contiguous()
+            xb = x[:, receiver_slice, :].contiguous()
+            a = metric[:, donor_slice, :].contiguous()
+            b = metric[:, receiver_slice, :].contiguous()
+            wa = size[:, donor_slice, 0].contiguous()
+            wb = size[:, receiver_slice, 0].contiguous()
+        else:
+            a_idx_expanded_x = a_idx_sorted.unsqueeze(-1).expand(-1, -1, C)
+            b_idx_expanded_x = b_idx_sorted.unsqueeze(-1).expand(-1, -1, C)
+            a_idx_expanded_metric = a_idx_sorted.unsqueeze(-1).expand(-1, -1, D_metric)
+            b_idx_expanded_metric = b_idx_sorted.unsqueeze(-1).expand(-1, -1, D_metric)
+
+            xa = torch.gather(x, dim=1, index=a_idx_expanded_x)
+            xb = torch.gather(x, dim=1, index=b_idx_expanded_x)
+            a = torch.gather(metric, dim=1, index=a_idx_expanded_metric)
+            b = torch.gather(metric, dim=1, index=b_idx_expanded_metric)
+            wa = torch.gather(size[..., 0], dim=1, index=a_idx_sorted)
+            wb = torch.gather(size[..., 0], dim=1, index=b_idx_sorted)
+        wa_before_merge = wa.detach()
+        wb_before_merge = wb.detach()
+
+        if source_trace_mode == "center":
+            token_center = self._tome_info.get("token_center", None)
+            if token_center is None:
+                token_center = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(0).expand(B, -1)
+            if use_strided_fast_path:
+                center_a = token_center[:, donor_slice].contiguous()
+                center_b = token_center[:, receiver_slice].contiguous()
+            else:
+                center_a = torch.gather(token_center, dim=1, index=a_idx_sorted)
+                center_b = torch.gather(token_center, dim=1, index=b_idx_sorted)
+
+        # Extract source matrix for a and b tokens
+        if source_matrix is not None:
+            width = self._tome_info["source_matrix_width"]
+            a_idx_expanded_source = a_idx_sorted.unsqueeze(-1).expand(-1, -1, width)
+            b_idx_expanded_source = b_idx_sorted.unsqueeze(-1).expand(-1, -1, width)
+            source_a = torch.gather(source_matrix, dim=1, index=a_idx_expanded_source)
+            source_b = torch.gather(source_matrix, dim=1, index=b_idx_expanded_source)
+
+            # Save old weights for source update
+            wa_old = wa.clone()
+            wb_old = wb.clone()
+
+        # =================================================================================== #
+
+        # 对齐合并粒度 t
+        t = max(int(self._tome_info.get("t", 1)), 1)
+        r = (r // t) * t
+        # print(f"r: {r}")
+        # print(f"a: {a.shape}")
+        # print(f"b: {b.shape}")
+        assign, _out = self._select(k=r, a=a, b=b,
+                                    a_orig_idx=a_idx_sorted,
+                                    b_orig_idx=b_idx_sorted)
+
+        # Handle narrow matrix case for local window
+        window_size = self._tome_info.get("window_size")
+        if window_size is not None and window_size > 0:
+            # assign is (B, Na, 2*window_size+1), need to scatter to (B, Nb, Na)
+            B_cur, Na_cur = assign.shape[0], assign.shape[1]
+            Nb_cur = xb.shape[1]
+            C_cur = xa.shape[-1]
+
+            # Get stored b_indices and valid_mask
+            b_indices = self._tome_info['assign_b_indices']  # (1, Na, 2*window_size+1)
+            valid_mask = self._tome_info['assign_valid_mask']  # (1, Na, 2*window_size+1)
+
+            # Get original indices for physical locality check
+            a_orig_idx = self._tome_info.get('assign_a_orig_idx')  # (B, Na) or None
+            b_orig_idx = self._tome_info.get('assign_b_orig_idx')  # (B, Nb) or None
+
+            # Compute physical locality mask if original indices are provided
+            physical_mask = valid_mask.clone()  # Start with valid_mask
+            if a_orig_idx is not None and b_orig_idx is not None:
+                # For each a[i], check if |a_orig_idx[i] - b_orig_idx[b_indices[i,j]]| <= window_size
+                # NOTE: a_orig_idx and b_orig_idx may have been aligned in _select if Na != Nb
+                # So their shape[1] may be min(Na, Nb), not the original Na/Nb
+                # a_orig_idx: (B, Na_aligned) -> (B, Na_aligned, 1)
+                # b_indices: (1, Na, 2*window_size+1)
+                # b_orig_idx: (B, Nb_aligned)
+
+                # Use actual shapes from orig_idx tensors
+                Na_aligned = a_orig_idx.shape[1]
+                Nb_aligned = b_orig_idx.shape[1]
+
+                # Only proceed if aligned sizes match current assign shape
+                if Na_aligned == Na_cur:
+                    a_orig_expanded = a_orig_idx.unsqueeze(2)  # (B, Na_aligned, 1)
+                    # Clamp b_indices to valid range of b_orig_idx
+                    b_indices_clamped = b_indices.clamp(0, Nb_aligned - 1)  # (1, Na, 2*window_size+1)
+                    b_indices_expanded = b_indices_clamped.expand(B_cur, -1, -1)  # (B, Na, 2*window_size+1)
+
+                    # If Na from b_indices doesn't match Na_aligned, truncate
+                    if b_indices_expanded.shape[1] > Na_aligned:
+                        b_indices_expanded = b_indices_expanded[:, :Na_aligned, :]
+
+                    # Ensure indices are within bounds
+                    b_indices_expanded = b_indices_expanded.clamp(0, Nb_aligned - 1)
+
+                    # Gather b's original positions at window indices
+                    b_orig_expanded = b_orig_idx.unsqueeze(1).expand(-1, Na_aligned, -1)  # (B, Na_aligned, Nb_aligned)
+                    b_orig_at_window = torch.gather(
+                        b_orig_expanded,  # (B, Na_aligned, Nb_aligned)
+                        dim=2,
+                        index=b_indices_expanded  # (B, Na_aligned, 2*window_size+1)
+                    )  # (B, Na_aligned, 2*w+1)
+
+                    # Check physical distance
+                    physical_distance = torch.abs(a_orig_expanded - b_orig_at_window)  # (B, Na_aligned, 2*w+1)
+                    physical_local_mask = physical_distance <= window_size  # (B, Na_aligned, 2*w+1)
+
+                    # Combine with valid_mask
+                    physical_mask = valid_mask & physical_local_mask  # (B, Na, 2*w+1)
+
+            # Apply physical mask to assign (use same dtype as assign)
+            assign = assign * physical_mask.to(assign.dtype)
+
+            # Clamp indices for scatter operation
+            b_indices_clamped = b_indices.clamp(0, Nb_cur - 1)  # (1, Na, 2*window_size+1)
+
+            # Compute weighted xa: (B, Na, C)
+            weighted_xa = wa[..., None] * xa  # (B, Na, C)
+
+            # For each b token, accumulate from corresponding a tokens in window
+            # We need to scatter assign.transpose(-1, -2) @ weighted_xa
+            # assign: (B, Na, 2*window_size+1)
+            # weighted_xa: (B, Na, C)
+
+            # Expand assign for broadcasting with xa
+            assign_expanded = assign.unsqueeze(-1)  # (B, Na, 2*window_size+1, 1)
+            weighted_xa_expanded = weighted_xa.unsqueeze(2)  # (B, Na, 1, C)
+            contribution = assign_expanded * weighted_xa_expanded  # (B, Na, 2*window_size+1, C)
+
+            # Scatter contributions to xb
+            # For scatter_add on dim=1, index shape must match src shape
+            b_indices_expanded = b_indices_clamped.expand(B_cur, -1, -1).unsqueeze(-1).expand(-1, -1, -1, C_cur)  # (B, Na, 2*window_size+1, C)
+            xb_contrib = torch.zeros(B_cur, Nb_cur, C_cur, device=xb.device, dtype=xb.dtype)
+
+            # Reshape for scatter: (B, Na*window, C)
+            contribution_flat = contribution.reshape(B_cur, -1, C_cur)  # (B, Na*(2*window_size+1), C)
+            b_indices_flat = b_indices_expanded.reshape(B_cur, -1, C_cur)  # (B, Na*(2*window_size+1), C)
+            xb_contrib.scatter_add_(dim=1, index=b_indices_flat, src=contribution_flat)
+            xb = wb[..., None] * xb + xb_contrib
+
+            # Similar for wb
+            wa_expanded = wa.unsqueeze(2)  # (B, Na, 1)
+            wb_contribution = assign_expanded[..., 0] * wa_expanded  # (B, Na, 2*window_size+1)
+            b_indices_expanded_1d = b_indices_clamped.expand(B_cur, -1, -1)  # (B, Na, 2*window_size+1)
+            wb_contrib = torch.zeros(B_cur, Nb_cur, device=wb.device, dtype=wb.dtype)
+
+            # Reshape for scatter: (B, Na*window)
+            wb_contribution_flat = wb_contribution.reshape(B_cur, -1)  # (B, Na*(2*window_size+1))
+            b_indices_flat_1d = b_indices_expanded_1d.reshape(B_cur, -1)  # (B, Na*(2*window_size+1))
+            wb_contrib.scatter_add_(dim=1, index=b_indices_flat_1d, src=wb_contribution_flat)
+            wb = wb + wb_contrib
+
+            # Compute tmp: 1 - sum of assign over last dim
+            tmp = 1 - assign.sum(dim=-1)  # (B, Na)
+        else:
+            # Global case: assign is (B, Na, Nb)
+            xb = wb[..., None] * xb + assign.transpose(-1, -2) @ (wa[..., None] * xa)
+            wb = wb + (assign.transpose(-1, -2) @ wa[..., None])[..., 0]
+            tmp = 1 - assign.sum(dim=-1)
+
+        wa = wa * (tmp + (torch.clamp(tmp, min=0., max=1.) - tmp).detach())
+        wb_safe = torch.clamp(wb, min=torch.finfo(wb.dtype).eps)
+        xb = xb / wb_safe[..., None]
+
+        if source_trace_mode == "center":
+            with torch.no_grad():
+                if window_size is not None and window_size > 0:
+                    center_contribution = assign * (wa_before_merge * center_a).unsqueeze(2)
+                    center_b_contrib = torch.zeros(B_cur, Nb_cur, device=device, dtype=torch.float32)
+                    center_b_contrib.scatter_add_(
+                        dim=1,
+                        index=b_indices_clamped.expand(B_cur, -1, -1).reshape(B_cur, -1),
+                        src=center_contribution.reshape(B_cur, -1).float(),
+                    )
+                    center_b_new = (wb_before_merge.float() * center_b.float() + center_b_contrib) / wb_safe.float()
+                else:
+                    center_b_num = (
+                        wb_before_merge.float() * center_b.float()
+                        + (assign.transpose(-1, -2).float() @ (wa_before_merge.float() * center_a.float()).unsqueeze(-1))[..., 0]
+                    )
+                    center_b_new = center_b_num / wb_safe.float()
+                center_a_new = center_a.float()
+
+        # Update source_matrix
+        if source_matrix is not None:
+            trace_ctx = torch.no_grad() if source_trace_mode == "detached" else contextlib.nullcontext()
+            with trace_ctx:
+                width = self._tome_info["source_matrix_width"]
+                center = self._tome_info["source_matrix_center"]
+
+                window_size_check = self._tome_info.get("window_size")
+
+                if window_size_check is not None and window_size_check > 0:
+                    # Local window case: update source_matrix based on assign contributions
+
+                    # Get stored indices
+                    b_indices = self._tome_info['assign_b_indices']  # (1, Na, 2*window_size+1)
+                    b_indices_clamped = b_indices.clamp(0, Nb_cur - 1).expand(B_cur, -1, -1)  # (B, Na, 2*w+1)
+
+                    # Compute delta: physical distance from a to b
+                    a_orig_expanded = a_idx_sorted.unsqueeze(2)  # (B, Na, 1)
+                    batch_idx = torch.arange(B_cur, device=b_idx_sorted.device).view(-1, 1, 1)  # (B, 1, 1)
+                    b_orig_at_window = b_idx_sorted[batch_idx, b_indices_clamped]  # (B, Na, 2*w+1)
+                    delta = a_orig_expanded - b_orig_at_window  # (B, Na, 2*w+1)
+
+                    # Update source_matrix with correct logic:
+                    # When a[i] contributes weight w to b[j]:
+                    # 1. b[j] receives a[i]'s all sources scaled by w (with position shift)
+                    # 2. a[i] loses those contributions (scaled by w)
+
+                    # Prepare output tensors
+                    source_b_new = source_b.clone()
+
+                    # OPTIMIZED: Compute transferred contributions once and reuse
+                    # Transferred contributions: source_a[i, k] * assign[i, j_local]
+                    transferred = source_a.unsqueeze(2) * assign.unsqueeze(-1)  # (B, Na, 2*w+1, width)
+
+                    # Compute target positions in b's reference frame
+                    k_range = torch.arange(width, device=x.device).view(1, 1, 1, -1)
+                    delta_4d = delta.unsqueeze(-1)  # (B, Na, 2*w+1, 1)
+
+                    # New position in b's frame: k + delta
+                    target_k = k_range + delta_4d  # (B, Na, 2*w+1, width)
+                    valid_target = (target_k >= 0) & (target_k < width)
+                    target_k_clamped = target_k.clamp(0, width - 1)
+
+                    # Apply valid mask (use same dtype as transferred)
+                    transferred_masked = transferred * valid_target.to(transferred.dtype)
+
+                    # Scatter to source_b using b_indices
+                    batch_idx = torch.arange(B_cur, device=x.device).view(-1, 1, 1, 1)
+                    b_idx_4d = b_indices_clamped.unsqueeze(-1)  # (B, Na, 2*w+1, 1)
+
+                    # Linear index: batch * (Nb * width) + b_idx * width + target_k
+                    linear_idx = batch_idx * Nb_cur * width + b_idx_4d * width + target_k_clamped
+
+                    # Flatten and scatter_add
+                    source_b_flat = source_b_new.reshape(-1)
+                    source_b_flat.scatter_add_(0, linear_idx.reshape(-1), transferred_masked.reshape(-1))
+                    source_b_new = source_b_flat.reshape(B_cur, Nb_cur, width)
+
+                    # Update source_a with SAME logic as wa update
+                    # wa uses: wa * (tmp + (clamp(tmp, 0, 1) - tmp).detach())
+                    # source_a should use the SAME scaling factor
+                    # Note: source_a.sum(dim=-1) should equal wa after this operation
+                    tmp_source = tmp.unsqueeze(-1)  # (B, Na, 1) - broadcast over width dimension
+                    source_a_new = source_a * (tmp_source + (torch.clamp(tmp_source, min=0., max=1.) - tmp_source).detach())
+                else:
+                    # Global case: exact source propagation with full assign.
+                    # If a[i] contributes to b[j], a[i]'s source distribution is
+                    # shifted from a's relative frame into b's relative frame by
+                    # delta = pos(a) - pos(b), then accumulated into b[j].
+                    source_b_new = source_b.clone()
+                    tmp_source = tmp.unsqueeze(-1)
+                    source_a_new = source_a * (
+                        tmp_source + (torch.clamp(tmp_source, min=0., max=1.) - tmp_source).detach()
+                    )
+
+                    k_range = torch.arange(width, device=x.device).view(1, 1, 1, -1)
+                    j_range = torch.arange(Nb, device=x.device).view(1, 1, Nb, 1)
+                    batch_idx = torch.arange(B, device=x.device).view(B, 1, 1, 1)
+                    source_b_flat = source_b_new.reshape(-1)
+
+                    # Chunk over a-tokens to avoid materializing [B, Na, Nb, width]
+                    # for the global path. This path is intentionally exact, not
+                    # optimized as the default fast training route.
+                    chunk = int(self._tome_info.get("global_source_chunk_size", 1))
+                    chunk = max(chunk, 1)
+                    for start in range(0, Na, chunk):
+                        end = min(start + chunk, Na)
+                        assign_chunk = assign[:, start:end, :]  # (B, ch, Nb)
+                        source_chunk = source_a[:, start:end, :]  # (B, ch, width)
+                        delta = (
+                            a_idx_sorted[:, start:end].unsqueeze(2)
+                            - b_idx_sorted.unsqueeze(1)
+                        )  # (B, ch, Nb)
+
+                        target_k = k_range[:, :end - start] + delta.unsqueeze(-1)
+                        valid_target = (target_k >= 0) & (target_k < width)
+                        target_k_clamped = target_k.clamp(0, width - 1)
+                        transferred = (
+                            assign_chunk.unsqueeze(-1)
+                            * source_chunk.unsqueeze(2)
+                            * valid_target.to(source_a.dtype)
+                        )
+                        linear_idx = batch_idx * Nb * width + j_range * width + target_k_clamped
+                        source_b_flat.scatter_add_(0, linear_idx.reshape(-1), transferred.reshape(-1))
+
+                    source_b_new = source_b_flat.reshape(B, Nb, width)
+
+                # Write back to full source_matrix
+                source_matrix_new = source_matrix.clone()
+
+                # Scatter a's sources back
+                a_idx_expanded_source = a_idx_sorted.unsqueeze(-1).expand(-1, -1, width)
+                source_matrix_new.scatter_(dim=1, index=a_idx_expanded_source, src=source_a_new)
+
+                # Scatter b's sources back
+                b_idx_expanded_source = b_idx_sorted.unsqueeze(-1).expand(-1, -1, width)
+                source_matrix_new.scatter_(dim=1, index=b_idx_expanded_source, src=source_b_new)
+
+                # Optional: normalize to ensure sum = 1 (compensate for floating point errors)
+                if self._tome_info.get("normalize_source_matrix", False):
+                    source_sum = source_matrix_new.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+                    source_matrix_new = source_matrix_new / source_sum
+
+                source_matrix = source_matrix_new
+
+        # =================================================================================== #
+        # w = torch.cat([wa, wb], dim=-1)
+        # nx = torch.cat([xa, xb], dim=1)
+        # nidxs = w.argsort(dim=-1, descending=True)
+        # w = w.gather(dim=-1, index=nidxs)
+        # nx = nx.gather(dim=-2, index=nidxs[..., None].expand_as(nx))
+        # =================================================================================== #
+
+        # =================================================================================== #
+
+        # Restore original spatial order based on the random grouping
+        # SOFT MERGE: Keep ALL tokens (both a and b), only weights change
+        # wa becomes smaller for merged tokens, wb becomes larger for receiving tokens
+        Na_curr = xa.shape[1]  # Should equal Na (all a tokens kept)
+        Nb_curr = xb.shape[1]  # Should equal Nb (all b tokens kept)
+        n_total = Na_curr + Nb_curr  # Should equal Na + Nb
+
+        if use_strided_fast_path:
+            # Recreate row-major patch order directly. For donor parity 0 the
+            # order is [a0,b0,a1,b1,...]; for donor parity 1 it is reversed.
+            if donor_patch_parity == 0:
+                even_tokens, odd_tokens = xa, xb
+                even_weights, odd_weights = wa, wb
+            else:
+                even_tokens, odd_tokens = xb, xa
+                even_weights, odd_weights = wb, wa
+            nx = torch.stack((even_tokens, odd_tokens), dim=2).reshape(
+                B, n_tokens, C
+            )
+            w = torch.stack((even_weights, odd_weights), dim=2).reshape(
+                B, n_tokens
+            )
+            if source_trace_mode == "center":
+                with torch.no_grad():
+                    if donor_patch_parity == 0:
+                        even_centers, odd_centers = center_a_new, center_b_new
+                    else:
+                        even_centers, odd_centers = center_b_new, center_a_new
+                    center_sorted = torch.stack(
+                        (even_centers, odd_centers), dim=2
+                    ).reshape(B, n_tokens)
+        else:
+            # Combine all donor and receiver tokens with their original
+            # positions, then restore the generic random/seeded order.
+            all_orig_pos = torch.cat([a_idx_sorted, b_idx_sorted], dim=1)
+            all_tokens = torch.cat([xa, xb], dim=1)
+            all_weights = torch.cat([wa, wb], dim=1)
+            sort_indices = torch.argsort(all_orig_pos, dim=1)
+            sort_indices_expanded = sort_indices.unsqueeze(-1).expand(-1, -1, C)
+            nx = torch.gather(all_tokens, dim=1, index=sort_indices_expanded)
+            w = torch.gather(all_weights, dim=1, index=sort_indices)
+
+            if source_trace_mode == "center":
+                with torch.no_grad():
+                    all_centers = torch.cat([center_a_new, center_b_new], dim=1)
+                    center_sorted = torch.gather(
+                        all_centers, dim=1, index=sort_indices
+                    )
+
+        # =================================================================================== #
+
+        # Handle cls token if present
+        has_cls = self._tome_info.get("class_token", True)
+        if has_cls:
+            x_output = torch.cat([x[:, :1], nx, x[:, n:]], dim=1)
+            size_output = torch.cat([size[:, :1, 0], w, size[:, n:, 0]], dim=-1).unsqueeze(-1)
+            if source_trace_mode == "center":
+                cls_center = self._tome_info.get("token_center", None)
+                if cls_center is None:
+                    cls_center = torch.zeros(B, 1, device=device, dtype=torch.float32)
+                else:
+                    cls_center = cls_center[:, :1].float()
+                tail_center = self._tome_info.get("token_center", None)
+                tail_center = tail_center[:, n:].float() if tail_center is not None and n < tail_center.shape[1] else center_sorted[:, :0]
+                self._tome_info["token_center"] = torch.cat([cls_center, center_sorted, tail_center], dim=1)
+        else:
+            x_output = torch.cat([nx, x[:, n:]], dim=1)
+            size_output = torch.cat([w, size[:, n:, 0]], dim=-1).unsqueeze(-1)
+            if source_trace_mode == "center":
+                tail_center = self._tome_info.get("token_center", None)
+                tail_center = tail_center[:, n:].float() if tail_center is not None and n < tail_center.shape[1] else center_sorted[:, :0]
+                self._tome_info["token_center"] = torch.cat([center_sorted, tail_center], dim=1)
+        return x_output, size_output, n , _out, source_matrix
+
+    def _merge_eval(self, x, size, r, n, metric, source_matrix=None):
+        metric = metric['metric']
+        norm = metric.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        metric = metric / norm
+
+        r = min(r, (n - 1) // 2)
+        if r <= 0:
+            return x, size, n, None, source_matrix
+
+        merge, _, current_level_map = bipartite_soft_matching(metric,
+                                           r,
+                                           self._tome_info["class_token"],
+                                           self._tome_info["distill_token"],
+                                           )
+        if self._tome_info["trace_source"]:
+            if "source_tracking_mode" in self._tome_info:
+                if self._tome_info["source_tracking_mode"] == 'map':
+                    source_map = self._tome_info["source_map"]
+                    if source_map is None:
+                        b, t, _ = x.shape
+                        source_map = torch.arange(t, device=x.device, dtype=torch.long).expand(b, -1)
+                    self._tome_info["source_map"] = merge_source_map(current_level_map, x, source_map)
+                else:
+                    source_matrix = self._tome_info["source_matrix"]
+                    self._tome_info["source_matrix"] = merge_source_matrix(merge, x, source_matrix)
+
+        x, self._tome_info["size"] = merge_wavg(merge, x, self._tome_info["size"])
+        return x, self._tome_info["size"], x.size(1), None, source_matrix
+
+    def merge(self, x, size, r, n, metric, source_matrix=None):
+        if self.training:
+            return self._merge_train(x, size, r, n, metric, source_matrix)
+        return self._merge_eval(x, size, r, n, metric, source_matrix)
+
+    def forward(self, x, size, n=None, source_matrix=None):
+        if size is None:
+            size=torch.ones_like(x[..., 0, None])
+        tmp, metric = self.attn(self.norm1(x), size=size)
+        assert isinstance(metric['metric'], (float, torch.Tensor)), "metric not a float or torch.Tensor"
+        x = x + self.drop_path1(self.ls1(tmp))
+        # Merging
+        r = self._tome_info["r"].pop(0)
+        if size is not None and r > 0 and n > 0:
+            x, size, n, metric, source_matrix = self.merge(x, size, r, n, metric, source_matrix)
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+
+        return x, size, n, metric, source_matrix
+
+
+def make_tome_class(transformer_class):
+    class DTEMVisionTransformer(transformer_class):
+        """
+        Modifications:
+        - Initialize r, token size, and token sources.
+        """
+
+        def forward_features(self, x):
+            x = self.patch_embed(x)
+            x = self._pos_embed(x)
+            x = self.patch_drop(x)
+            x = self.norm_pre(x)
+
+            n = x.size(1)
+            self._tome_info["r"] = parse_r(
+                len(self.blocks), self.r, self._tome_info["total_merge"]
+            )
+            self._tome_info["size"] = torch.ones_like(x[..., 0, None])
+            self._tome_info["source_map"] = None
+
+            out_dicts = []
+            source_matrix = None  # Initialize, will be created in first block
+            for block in self.blocks:
+                x, size, n, out_dict, source_matrix = block(x, self._tome_info["size"], n=n, source_matrix=source_matrix)
+                out_dicts.append(out_dict)
+
+            x = self.norm(x)
+            return x, out_dicts
+
+        def forward(self, x, return_out_dicts=False):
+            x, out_dicts = self.forward_features(x)
+            x = self.forward_head(x)
+            if return_out_dicts:
+                return x, out_dicts
+            return x
+
+    return DTEMVisionTransformer
+
+
+
+""""
+Learning to Merge Tokens via Decoupled Embedding for Efficient Vision Transformers, NIPS'2024
+    - paper (https://openreview.net/forum?id=pVPyCgXv57)
+    - code  (https://github.com/movinghoon/DTEM)
+"""
+def dtem_apply_patch(
+    model: VisionTransformer,
+    feat_dim=None,
+    trace_source=True,
+    prop_attn=True,
+    source_tracking_mode: str = 'map',
+    default_r: int = 2,
+    window_size: int = None,
+    t: int = 1,
+    use_softkmax: bool = False,
+    swa_size: int = None,
+):
+    """
+    扩展：
+    - default_r: 默认合并强度（用于初始化 model.r）
+    - window_size: 局部注意力/局部匹配窗口半径（None 或 <=0 表示禁用）
+    - t: 合并粒度，使每层实际 r 对齐到 t 的整数倍
+    """
+    DTEMVisionTransformer = make_tome_class(model.__class__)
+    model.__class__ = DTEMVisionTransformer
+
+    model.r = default_r
+    model._tome_info = {
+        "r": model.r,
+        "size": None,
+        "source_map": None,
+        "source_matrix": None,
+        "total_merge": None,
+        "trace_source": trace_source,
+        "prop_attn": prop_attn,
+        "class_token": getattr(model, 'cls_token', None) is not None,
+        "distill_token": getattr(model, 'dist_token', None) is not None,
+        "source_tracking_mode": source_tracking_mode,
+        "source_trace_mode": "matrix" if trace_source and source_tracking_mode == "matrix" else "none",
+        "k2": None,
+        "tau1": 1.0,
+            "tau2": 30.0,  # Temperature for softmax/ThreTopK (higher = smoother)
+        "feat_dim": feat_dim,
+        "window_size": window_size,
+        "t": t,
+        "use_softkmax": use_softkmax,
+        "swa_size": swa_size,
+    }
+    for module in model.modules():
+        if isinstance(module, (Block, TimmBlock)):
+            module.__class__ = DTEMBlock
+            module._tome_info = model._tome_info
+        elif isinstance(module, (Attention, TimmAttention)):
+            module.__class__ = DTEMAttention
+            module._tome_info = model._tome_info
+            module.patch(model._tome_info["feat_dim"])
+
+
+# Archieve Version #
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# from timm.layers import Mlp, DropPath, use_fused_attn
+# from timm.models.vision_transformer import VisionTransformer, LayerScale
+# from timm.models.vision_transformer import Attention as TimmAttention
+# from timm.models.vision_transformer import Block as TimmBlock
+# from functools import partial
+
+# from opentome.tome.tome import (
+#     bipartite_soft_matching,
+#     merge_source_matrix,
+#     merge_source_map,
+#     merge_wavg,
+#     parse_r,
+# )
+# from opentome.timm import Attention, Block
+
+
+# # ---------------------- dtem 专用通用 map/trace 工具 ---------------------- #
+# def merge_source_map_for_dtem(current_level_map, source_map):
+#     if source_map is None:
+#         return current_level_map
+#     return torch.gather(current_level_map, dim=1, index=source_map)
+
+# @torch.no_grad()
+# def trace_token_merge(x, size, token_map):
+#     """
+#     将 token_map 所指定的分组进行加权聚合，返回合并后的 x/size 以及压缩后的映射：
+#     - x: [B, L, C]
+#     - size: [B, L] 或 [B, L, 1] 或 None（None 表示等权重）
+#     - token_map: [B, L]，每个原 token 合并到的目标 group 索引
+#     返回 (x_merged [B, M_max, C], size_merged [B, M_max, 1], compact_token_map [B, L])
+#     """
+#     B, L, C = x.shape
+#     device = x.device
+#     dtype = x.dtype
+
+#     if size is None:
+#         size_local = torch.ones(B, L, device=device, dtype=dtype)
+#     else:
+#         size_local = size.squeeze(-1) if size.ndim == 3 else size
+
+#     offset = torch.arange(B, device=device, dtype=torch.long).view(B, 1) * L
+#     global_token_map = token_map + offset
+
+#     unique_global_indices, inverse_indices = torch.unique(global_token_map.flatten(), return_inverse=True)
+#     batch_indices = torch.div(unique_global_indices, L, rounding_mode='floor')
+
+#     perm = torch.argsort(unique_global_indices)
+#     sorted_batch_indices = batch_indices[perm]
+#     is_new_batch = torch.cat([torch.tensor([True], device=device), sorted_batch_indices[1:] != sorted_batch_indices[:-1]])
+#     batch_group_ids = torch.cumsum(is_new_batch.long(), dim=0) - 1
+#     segment_starts = torch.where(is_new_batch)[0]
+#     local_rank_sorted = torch.arange(len(unique_global_indices), device=device) - segment_starts[batch_group_ids]
+#     inv_perm = torch.empty_like(perm)
+#     inv_perm[perm] = torch.arange(len(unique_global_indices), device=device)
+#     local_rank_unsorted = local_rank_sorted[inv_perm]
+#     compact_token_map = local_rank_unsorted[inverse_indices].view(B, L)
+
+#     counts_per_batch = torch.bincount(batch_indices, minlength=B)
+#     M_max = counts_per_batch.max().item()
+
+#     index = compact_token_map.unsqueeze(-1).expand_as(x)
+#     x_w = x * size_local.unsqueeze(-1)
+
+#     num = torch.zeros(B, M_max, C, device=device, dtype=dtype)
+#     den = torch.zeros(B, M_max, device=device, dtype=dtype)
+
+#     num.scatter_add_(dim=1, index=index, src=x_w)
+#     den.scatter_add_(dim=1, index=compact_token_map, src=size_local)
+
+#     den_clamped = torch.clamp(den, min=torch.finfo(den.dtype).eps)
+#     x_merged = num / den_clamped.unsqueeze(-1)
+#     size_merged = den.unsqueeze(-1)
+
+#     return x_merged, size_merged, compact_token_map
+
+# def token_unmerge_from_map_for_dtem(merged_tokens, token_map_compact, T_full):
+#     """
+#     将长度 L-k 的 merged_tokens 还原到原长度 L：
+#     - merged_tokens: [B, L-k, C]
+#     - token_map_compact: [B, L]，每个原 token 在合并后序列中的位置
+#     - T_full: 原长度 L
+#     返回: [B, L, C]
+#     """
+#     B, Lk, C = merged_tokens.shape
+#     device = merged_tokens.device
+#     b_idx = torch.arange(B, device=device)[:, None].expand(B, T_full)
+#     return merged_tokens[b_idx, token_map_compact]
+
+# class DTEMLinear(nn.Linear):
+#     def __init__(self, qkv_layer, feat_dim):
+#         super().__init__(in_features=qkv_layer.weight.shape[1], out_features=qkv_layer.weight.shape[0] + feat_dim, bias=True)
+#         # qkv
+#         self.qkv_layer = qkv_layer
+
+#         # metric
+#         self.feat_dim = feat_dim
+#         self.metric_layer = nn.Linear(qkv_layer.weight.shape[-1], feat_dim)
+
+#         # copy
+#         self.update()
+
+#     @torch.no_grad()
+#     def update(self):
+#         # qkv -> self
+#         self.weight[:-self.feat_dim].copy_(self.qkv_layer.weight)
+#         self.bias[:-self.feat_dim].copy_(self.qkv_layer.bias)
+
+#         # metric_layer -> self
+#         self.weight[-self.feat_dim:].copy_(self.metric_layer.weight)
+#         self.bias[-self.feat_dim:].copy_(self.metric_layer.bias)
+
+#     def train(self, mode=True):
+#         if mode is False:   # if eval
+#             self.update()
+#         return super().train(mode)
+
+#     def forward(self, input: torch.Tensor):
+#         if not self.training:
+#             out = F.linear(input, self.weight, self.bias)
+#             return out[..., :-self.feat_dim], out[..., -self.feat_dim:]
+
+#         # training
+#         out1 = self.qkv_layer(input)  # Shape: (B, N, 3 * num_heads * head_dim)
+#         out2 = self.metric_layer(input.detach())  # Shape: (B, N, feat_dim)
+#         return out1, out2
+
+
+# try:
+#     from flash_attn import flash_attn_func
+#     FLASH_ATTN_AVAILABLE = True
+# except Exception:
+#     FLASH_ATTN_AVAILABLE = False
+
+
+# """
+#     timm - deit patch
+# """
+# class DTEMAttention(Attention):
+#     def patch(self, feat_dim):
+#         if feat_dim is not None:
+#             out_dim = feat_dim
+#         else:
+#             dim = self.head_dim * self.num_heads
+#             out_dim = self.head_dim if dim < 1024 else 2 * self.head_dim
+#         # add metric_layer
+#         self.qkv = DTEMLinear(self.qkv, out_dim)
+
+#     def forward(self, x, size=None):    # x:(B, N, C), size:(B, N) or (B, N, 1)
+#         B, N, C = x.shape
+#         out1, out2 = self.qkv(x)
+#         qkv = out1.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+#         q, k, v = qkv.unbind(0)     # B, H, N, head_dim
+#         q, k = self.q_norm(q), self.k_norm(k)
+
+#         # fp32 for softmax computation
+#         q, k, v = q.type(torch.float32), k.type(torch.float32), v.type(torch.float32)
+#         with torch.cuda.amp.autocast(dtype=torch.float32, enabled=True):
+#             q = q * self.scale
+#             window_size = self._tome_info.get("window_size")
+#             if window_size is not None and window_size > 0:
+#                 # 尝试使用 triton 实现；失败回退到 naive/flash
+#                 x_bnc = None
+#                 try:
+#                     from .local_attn_triton import local_attn_sizebias_bhnd
+#                     x_bnhd = local_attn_sizebias_bhnd(q, k, v, size, window_size, softmax_scale=1.0)  # (B, N, H, D)
+#                     x_bnc = x_bnhd.reshape(B, N, self.num_heads * self.head_dim)
+#                     x_bnc = self.attn_drop(x_bnc)
+#                 except Exception:
+#                     # 先试 flash，再退回 naive
+#                     x_bnc = self._flash_local_attention(q, k, v, size, window_size, x_dtype=x.dtype) if FLASH_ATTN_AVAILABLE else None
+#                     if x_bnc is None:
+#                         x_bnc = self._naive_local_attention(q, k, v, size, window_size, x_dtype=x.dtype)
+#             else:
+#                 # 全局注意力路径
+#                 attn = q @ k.transpose(-2, -1)
+#                 if size is None or (not self._tome_info["r"]): # for MAE
+#                     attn = attn.softmax(dim=-1)
+#                 else:   # as in DynamicViT
+#                     _attn = attn - torch.max(attn, dim=-1, keepdim=True)[0]
+#                     size_ = size if size is not None else torch.ones(B, N, 1, device=x.device, dtype=torch.float32)
+#                     _attn = _attn.exp_() * size_[:, None, None, :, 0].type(torch.float32)
+#                     attn = _attn / _attn.sum(dim=-1, keepdim=True)
+#                 attn = self.attn_drop(attn)
+#                 # (B, H, N, D) -> (B, N, C)
+#                 x_bnc = (attn @ v).permute(0, 2, 1, 3).contiguous().view(B, N, self.num_heads * self.head_dim)
+
+#         x = x_bnc
+#         x = self.proj(x)
+#         x = self.proj_drop(x)
+#         metric = dict(
+#             q = q,
+#             k = k,
+#             v = v,
+#             x = x,
+#             metric = out2
+#         )
+#         return x, metric
+
+#     def _naive_local_attention(self, q, k, v, size, window_size, x_dtype=torch.float32):
+#         """
+#         无依赖的局部窗口注意力回退实现。
+#         q,k,v: (B, H, N, D)
+#         size: (B, N, 1) or (B, N) or None
+#         返回: (B, N, C)
+#         """
+#         B, H, N, D = q.shape
+#         BH = B * H
+
+#         q_flat = q.transpose(1, 2).reshape(BH, N, D)
+#         k_flat = k.transpose(1, 2).reshape(BH, N, D)
+#         v_flat = v.transpose(1, 2).reshape(BH, N, D)
+
+#         padded_k = F.pad(k_flat, (0, 0, window_size, window_size))
+#         padded_v = F.pad(v_flat, (0, 0, window_size, window_size))
+
+#         k_windows = padded_k.unfold(dimension=1, size=2 * window_size + 1, step=1)  # (BH, N, win, D)
+#         v_windows = padded_v.unfold(dimension=1, size=2 * window_size + 1, step=1)  # (BH, N, win, D)
+#         k_windows = k_windows.transpose(-1, -2)
+#         v_windows = v_windows.transpose(-1, -2)
+#         q_reshaped = q_flat.unsqueeze(2)  # (BH, N, 1, D)
+#         attn = (q_reshaped @ k_windows.transpose(-1, -2)).squeeze(2)  # (BH, N, win)
+
+#         if size is not None:
+#             size_log = size.log().squeeze(-1) if size.ndim == 3 else size.log()
+#             size_bias_bh = size_log.unsqueeze(1).expand(-1, H, -1).reshape(BH, N)
+#             padded_size_bias = F.pad(size_bias_bh, (window_size, window_size), mode='constant', value=-1e9)
+#             size_bias_windows = padded_size_bias.unfold(dimension=1, size=2 * window_size + 1, step=1)
+#             attn = attn + size_bias_windows
+
+#         win_indices = torch.arange(-window_size, window_size + 1, device=q.device).view(1, -1)
+#         q_indices = torch.arange(N, device=q.device).view(-1, 1)
+#         abs_k_pos = q_indices + win_indices  # (N, win)
+#         mask = (abs_k_pos >= 0) & (abs_k_pos < N)
+#         attn = attn.masked_fill(~mask.unsqueeze(0), float('-inf'))
+
+#         attn = attn.softmax(dim=-1)
+#         attn = self.attn_drop(attn)
+
+#         attn_out_flat = (attn.unsqueeze(2) @ v_windows).squeeze(2)  # (BH, N, D)
+#         attn_out = attn_out_flat.view(B, H, N, D).transpose(1, 2)  # (B, N, H, D)
+#         x_processed = attn_out.reshape(B, N, H * D).to(x_dtype)
+#         return x_processed
+
+#     def _flash_local_attention(self, q, k, v, size, window_size, x_dtype=torch.float32):
+#         """
+#         使用 FlashAttention 的局部窗口注意力；失败返回 None。
+#         """
+#         B, H, N, D = q.shape
+#         try:
+#             q_nhw = q.permute(0, 2, 1, 3).contiguous()
+#             k_nhw = k.permute(0, 2, 1, 3).contiguous()
+#             v_nhw = v.permute(0, 2, 1, 3).contiguous()
+
+#             if q_nhw.dtype not in (torch.float16, torch.bfloat16):
+#                 q_nhw = q_nhw.to(torch.float16)
+#                 k_nhw = k_nhw.to(torch.float16)
+#                 v_nhw = v_nhw.to(torch.float16)
+
+#             out = flash_attn_func(
+#                 q_nhw, k_nhw, v_nhw,
+#                 dropout_p=self.attn_drop.p if self.training else 0.0,
+#                 softmax_scale=1.0,
+#                 causal=False,
+#                 window_size=(window_size, window_size),
+#                 deterministic=True,
+#             )
+
+#             if out.ndim == 3 and out.shape[-1] == H * D:
+#                 out = out.view(B, N, H, D)
+#             elif out.ndim != 4 or out.shape[:3] != (B, N, H):
+#                 out = out.reshape(B, N, H, D)
+
+#             attn_out_bhnd = out.permute(0, 2, 1, 3).contiguous()
+#             x_bnc = attn_out_bhnd.transpose(1, 2).reshape(B, N, H * D).to(x_dtype)
+#             return x_bnc
+#         except Exception:
+#             return None
+
+
+
+# class DTEMBlock(Block):
+
+#     def _select(self, k, a, b):
+#         """
+#         统一的选择逻辑：支持全局或局部窗口匹配，并支持跨层屏蔽。
+#         a: (B, Na, C), b: (B, Nb, C)
+#         返回 assign: (B, Na, Nb)
+#         """
+#         EPSILON = torch.finfo(torch.float32).eps
+#         B, Na, C = a.shape
+#         _, Nb, _ = b.shape
+#         device = a.device
+
+#         window_size = self._tome_info.get("window_size")
+#         if window_size is None or window_size <= 0:
+#             scores = a @ b.transpose(-1, -2)
+#             token_mask = self._tome_info.get("token_mask_for_dtem", None)
+#             if token_mask is not None:
+#                 Na_cur = a.shape[1]
+#                 Nb_cur = b.shape[1]
+#                 mask_a = token_mask[:, 1:1 + 2 * Na_cur:2]
+#                 mask_b = token_mask[:, 2:2 + 2 * Nb_cur:2]
+#                 neg_inf = torch.finfo(scores.dtype).min
+#                 scores = scores.masked_fill(mask_a.unsqueeze(-1), neg_inf)
+#                 scores = scores.masked_fill(mask_b.unsqueeze(1), neg_inf)
+#             _idx = scores.argsort(dim=-1, descending=True)
+#             _x = scores.gather(dim=-1, index=_idx)
+#             _x = _x / (self._tome_info.get("tau1", 1.0))
+#             khot = torch.zeros_like(_x)
+#             for _ in range(k):
+#                 onehot_approx = F.softmax(_x.view(B, -1) / (self._tome_info.get("tau2", 0.1)), dim=-1).view(B, Na, Nb)
+#                 khot += onehot_approx
+#                 khot_mask = torch.clamp(1 - onehot_approx.sum(dim=-1, keepdim=True), min=EPSILON)
+#                 _x = _x + torch.log(khot_mask)
+#             tmp = torch.clamp(khot.sum(dim=-1, keepdim=True).detach() - 1, min=0.) + 1.
+#             nkhot = khot / tmp
+#             nkhot = nkhot.to(scores.dtype)
+#             assign = torch.zeros_like(scores).scatter_reduce(-1, _idx, nkhot, reduce='sum')
+#         else:
+#             padded_b = F.pad(b, (0, 0, window_size, window_size))
+#             b_windows_unfolded = padded_b.unfold(dimension=1, size=2 * window_size + 1, step=1)
+#             b_windows = b_windows_unfolded.permute(0, 1, 3, 2)
+#             a_reshaped = a.unsqueeze(2)
+#             local_scores = (a_reshaped * b_windows).sum(dim=-1) / (self._tome_info.get("tau1", 1.0))
+
+#             token_mask = self._tome_info.get("token_mask_for_dtem", None)
+#             if token_mask is not None:
+#                 Na_cur = a.shape[1]
+#                 Nb_cur = b.shape[1]
+#                 mask_a = token_mask[:, 1:1 + 2 * Na_cur:2]
+#                 mask_b = token_mask[:, 2:2 + 2 * Nb_cur:2]
+#                 neg_inf_local = torch.finfo(local_scores.dtype).min
+#                 local_scores = local_scores.masked_fill(mask_a.unsqueeze(-1), neg_inf_local)
+#                 padded_mask_b = F.pad(mask_b, (window_size, window_size))
+#                 mask_windows_unfolded = padded_mask_b.unfold(dimension=1, size=2*window_size+1, step=1)
+#                 local_scores = local_scores.masked_fill(mask_windows_unfolded, neg_inf_local)
+
+#             khot = torch.zeros_like(local_scores)
+#             for _ in range(k):
+#                 onehot_approx = F.softmax(local_scores / (self._tome_info.get("tau2", 0.1)), dim=-1)
+#                 khot += onehot_approx
+#                 khot_mask = torch.clamp(1 - onehot_approx.sum(dim=-1, keepdim=True), min=EPSILON)
+#                 local_scores = local_scores + torch.log(khot_mask)
+
+#             tmp = torch.clamp(khot.sum(dim=-1, keepdim=True).detach() - 1, min=0.) + 1.
+#             nkhot = khot / tmp
+
+#             a_indices = torch.arange(Na, device=device).view(1, -1, 1)
+#             window_offsets = torch.arange(-window_size, window_size + 1, device=device).view(1, 1, -1)
+#             b_indices = a_indices + window_offsets
+#             valid_mask = (b_indices >= 0) & (b_indices < Nb)
+#             assign = torch.zeros(B, Na, Nb, device=device, dtype=a.dtype)
+#             nkhot_masked = torch.where(valid_mask.expand(B, -1, -1), nkhot, 0.0)
+#             b_indices_clamped = b_indices.clamp(0, Nb - 1)
+#             b_indices_expanded = b_indices_clamped.expand(B, -1, -1)
+#             assign.scatter_add_(dim=2, index=b_indices_expanded, src=nkhot_masked)
+
+#         with torch.no_grad():
+#             out_dict = {
+#                 'num': (nkhot if 'nkhot' in locals() else khot).sum().item(),
+#                 'max': (khot if 'khot' in locals() else nkhot).view(B, -1).max(dim=-1)[0].sum().item(),
+#             }
+#         return assign, out_dict
+
+#     @torch.no_grad()
+#     def _build_token_map_hard(self, metric_a, metric_b, r, n, t_orig, class_token, distill_token):
+#         B, Na, D = metric_a.shape
+#         _, Nb, _ = metric_b.shape
+#         device = metric_a.device
+
+#         if r == 0:
+#             token_map = torch.arange(t_orig, device=device).unsqueeze(0).expand(B, -1)
+#             src_mask = torch.zeros((B, t_orig), device=device, dtype=torch.bool)
+#             return token_map, src_mask
+
+#         window_size = self._tome_info.get("window_size")
+#         if window_size is not None and window_size > 0:
+#             padded_b = F.pad(metric_b, (0, 0, window_size, window_size if Na == Nb else window_size + 1))
+#             b_windows_unfolded = padded_b.unfold(dimension=1, size=2 * window_size + 1, step=1)
+#             b_windows = b_windows_unfolded.permute(0, 1, 3, 2)
+#             a_reshaped = metric_a.unsqueeze(2)
+#             local_scores = (a_reshaped * b_windows).sum(dim=-1)
+#             node_max, local_node_idx = local_scores.max(dim=-1)
+#             node_idx = torch.arange(Na, device=device).view(1, -1) + local_node_idx - window_size
+#         else:
+#             scores = metric_a @ metric_b.transpose(-1, -2)
+#             node_max, node_idx = scores.max(dim=-1)
+#         edge_idx = node_max.argsort(dim=-1, descending=True)
+#         src_a_idx = edge_idx[:, :r]
+#         unm_a_idx = edge_idx[:, r:]
+#         dst_b_idx = torch.gather(node_idx, dim=1, index=src_a_idx)
+#         src_orig_idx = 1 + 2 * src_a_idx
+#         unm_orig_idx = 1 + 2 * unm_a_idx
+#         dst_orig_idx = 2 + 2 * dst_b_idx
+#         b_all_orig_idx = torch.arange(2, 2 * Nb + 2, 2, device=device).unsqueeze(0).expand(B, -1)
+
+#         num_unm = Na - r
+#         unm_new_idx = torch.arange(1, num_unm + 1, device=device).unsqueeze(0).expand(B, -1)
+#         b_all_new_idx = torch.arange(num_unm + 1, num_unm + 1 + Nb, device=device).unsqueeze(0).expand(B, -1)
+#         dst_new_idx = torch.gather(b_all_new_idx, dim=1, index=dst_b_idx)
+
+#         token_map_batch = torch.arange(t_orig, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+#         src_mask_batch = torch.zeros((B, t_orig), device=device, dtype=torch.bool)
+#         map_builder = token_map_batch.clone()
+#         if unm_orig_idx.numel() > 0:
+#             map_builder.scatter_(dim=1, index=unm_orig_idx, src=unm_new_idx)
+#         map_builder.scatter_(dim=1, index=b_all_orig_idx, src=b_all_new_idx)
+#         map_builder.scatter_(dim=1, index=src_orig_idx, src=dst_new_idx)
+#         src_mask_batch.scatter_(dim=1, index=src_orig_idx, value=True)
+#         return map_builder, src_mask_batch
+
+#     def _merge_train(self, x, size, r, n, metric):
+#         metric = metric['metric']
+#         metric = metric / metric.norm(dim=-1, keepdim=True)
+
+#         n = n if self.training else x.size()[1]
+#         r = min(r, (n - 1) // 2)
+#         if r <= 0:
+#             return x, size, n, metric
+
+#         # 保证 size 为 [B, N, 1]
+#         if size is not None and size.ndim == 2:
+#             size = size.unsqueeze(-1)
+
+#         xa, xb = x[..., 1:n:2, :], x[..., 2:n:2, :]
+#         a, b = metric[..., 1:n:2, :], metric[..., 2:n:2, :]
+#         wa = size[..., 1:n:2, 0]
+#         wb = size[..., 2:n:2, 0]
+
+#         # 对齐合并粒度 t
+#         t = max(int(self._tome_info.get("t", 1)), 1)
+#         r = (r // t) * t
+#         assign, _out = self._select(k=r, a=a, b=b)
+
+#         # 层间屏蔽保护（如果存在）
+#         token_mask = self._tome_info.get("token_mask_for_dtem", None)
+#         if token_mask is not None:
+#             mask_a = token_mask[:, 1:n:2]
+#             mask_b = token_mask[:, 2:n:2]
+#             combined_mask = mask_a.unsqueeze(2) | mask_b.unsqueeze(1)
+#             assign.masked_fill_(combined_mask, 0)
+
+#         with torch.no_grad():
+#             B = a.shape[0]
+#             T_full = x.shape[1]
+#             current_level_map, src_mask_batch = self._build_token_map_hard(
+#                 a, b, r, B, T_full,
+#                 self._tome_info["class_token"],
+#                 self._tome_info["distill_token"],
+#             )
+#             if self._tome_info.get("token_map_for_dtem", None) is None:
+#                 self._tome_info["token_map_for_dtem"] = torch.arange(T_full, device=x.device)[None, :].expand(B, -1).clone()
+#             if self._tome_info.get("token_mask_for_dtem", None) is None:
+#                 self._tome_info["token_mask_for_dtem"] = torch.zeros(B, T_full, dtype=torch.bool, device=x.device)
+#             token_map_global = merge_source_map_for_dtem(current_level_map, self._tome_info["token_map_for_dtem"])
+#             self._tome_info["token_map_for_dtem"] = token_map_global
+#             self._tome_info["token_mask_for_dtem"] = self._tome_info["token_mask_for_dtem"] | src_mask_batch
+
+#         xb = wb[..., None] * xb + assign.transpose(-1, -2) @ (wa[..., None] * xa)
+#         wb = wb + (assign.transpose(-1, -2) @ wa[..., None])[..., 0]
+#         tmp = 1 - assign.sum(dim=-1)
+#         wa = wa * (tmp + (torch.clamp(tmp, min=0., max=1.) - tmp).detach())
+#         wb_safe = torch.clamp(wb, min=torch.finfo(wb.dtype).eps)
+#         xb = xb / wb_safe[..., None]
+
+#         w = torch.cat([wa, wb], dim=-1)
+#         nx = torch.cat([xa, xb], dim=1)
+#         nidxs = w.argsort(dim=-1, descending=True)
+#         w = w.gather(dim=-1, index=nidxs)
+#         nx = nx.gather(dim=-2, index=nidxs[..., None].expand_as(nx))
+
+#         x_output = torch.cat([x[:, :1], nx, x[:, n:]], dim=1)
+#         size_output = torch.cat([size[:, :1, 0], w, size[:, n:, 0]], dim=-1).unsqueeze(-1)
+#         return x_output, size_output, n - r, _out
+
+#     def _merge_eval(self, x, size, r, metric):    # eval：保留 ToMe 行为并补充 token_map_for_dtem 追踪
+#         metric = metric['metric']
+#         metric = metric / metric.norm(dim=-1, keepdim=True)
+
+#         merge, _, current_level_map = bipartite_soft_matching(metric,
+#                                            r,
+#                                            self._tome_info["class_token"],
+#                                            self._tome_info["distill_token"],
+#                                            )
+#         if self._tome_info["trace_source"]:
+#             # 兼容旧 map/matrix 追踪
+#             if "source_tracking_mode" in self._tome_info:
+#                 if self._tome_info["source_tracking_mode"] == 'map':
+#                     source_map = self._tome_info["source_map"]
+#                     if source_map is None:
+#                         b, t, _ = x.shape
+#                         source_map = torch.arange(t, device=x.device, dtype=torch.long).expand(b, -1)
+#                     self._tome_info["source_map"] = merge_source_map(current_level_map, x, source_map)
+#                 else: # 'matrix'
+#                     source_matrix = self._tome_info["source_matrix"]
+#                     self._tome_info["source_matrix"] = merge_source_matrix(merge, x, source_matrix)
+#             # 新 token_map_for_dtem 追踪（总是尝试维护）
+#             token_map = self._tome_info.get("token_map_for_dtem", None)
+#             b, t, _ = x.shape
+#             if token_map is None:
+#                 token_map = torch.arange(t, device=x.device, dtype=torch.long).expand(b, -1)
+#             self._tome_info["token_map_for_dtem"] = merge_source_map_for_dtem(current_level_map, token_map)
+
+#         x, self._tome_info["size"] = merge_wavg(merge, x, self._tome_info["size"])
+#         return x, self._tome_info["size"], x.size(1), None
+
+#     def merge(self, x, size, r, n, metric):
+#         return self._merge_train(x, size, r, n, metric) if self.training else self._merge_eval(x, size, r, metric)
+
+#     def forward(self, x, size, n=None):
+#         if size is None or n is None:
+#             tmp, _ = self.attn(self.norm1(x))
+#             x = x + self.drop_path1(self.ls1(tmp))
+#             x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+#             return x
+#         else:
+#             tmp, metric = self.attn(self.norm1(x), size=size)
+#             assert isinstance(metric['metric'], (float, torch.Tensor)), "metric not a float or torch.Tensor"
+#             x = x + self.drop_path1(self.ls1(tmp))
+#             # Merging
+#             r = self._tome_info["r"].pop(0)
+#             if size is not None and r > 0 and n > 0:
+#                 x, size, n, metric = self.merge(x, size, r, n, metric)
+#             x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+
+#             return x, size, n, metric
+
+
+# def make_tome_class(transformer_class):
+#     class DTEMVisionTransformer(transformer_class):
+#         """
+#         Modifications:
+#         - Initialize r, token size, and token sources.
+#         """
+
+#         def forward_features(self, x):
+#             x = self.patch_embed(x)
+#             x = self._pos_embed(x)
+#             x = self.patch_drop(x)
+#             x = self.norm_pre(x)
+
+#             n = x.size(1)
+#             self._tome_info["r"] = parse_r(
+#                 len(self.blocks), self.r, self._tome_info["total_merge"]
+#             )
+#             self._tome_info["size"] = torch.ones_like(x[..., 0, None])
+#             self._tome_info["source_map"] = None
+#             self._tome_info["source_matrix"] = None
+
+#             out_dicts = []
+#             for block in self.blocks:
+#                 x, size, n, out_dict = block(x, self._tome_info["size"], n=n)
+#                 out_dicts.append(out_dict)
+
+#             x = self.norm(x)
+#             return x, out_dicts
+
+#         def forward(self, x, return_out_dicts=False):
+#             x, out_dicts = self.forward_features(x)
+#             x = self.forward_head(x)
+#             if return_out_dicts:
+#                 return x, out_dicts
+#             return x
+
+#     return DTEMVisionTransformer
+
+
+
+# """"
+# Learning to Merge Tokens via Decoupled Embedding for Efficient Vision Transformers, NIPS'2024
+#     - paper (https://openreview.net/forum?id=pVPyCgXv57)
+#     - code  (https://github.com/movinghoon/DTEM)
+# """
+# def dtem_apply_patch(
+#     model: VisionTransformer,
+#     feat_dim=None,
+#     trace_source=True,
+#     prop_attn=True,
+#     source_tracking_mode: str = 'map',
+#     default_r: int = 2,
+#     window_size: int = None,
+#     t: int = 1,
+# ):
+#     """
+#     扩展：
+#     - default_r: 默认合并强度（用于初始化 model.r）
+#     - window_size: 局部注意力/局部匹配窗口半径（None 或 <=0 表示禁用）
+#     - t: 合并粒度，使每层实际 r 对齐到 t 的整数倍
+#     """
+#     DTEMVisionTransformer = make_tome_class(model.__class__)
+#     model.__class__ = DTEMVisionTransformer
+
+#     model.r = default_r
+#     model._tome_info = {
+#         "r": model.r,
+#         "size": None,
+#         # 旧版追踪结构：保留兼容
+#         "source_map": None,
+#         "source_matrix": None,
+#         "total_merge": None,
+#         "trace_source": trace_source,
+#         "prop_attn": prop_attn,
+#         "class_token": getattr(model, 'cls_token', None) is not None,
+#         "distill_token": getattr(model, 'dist_token', None) is not None,
+#         "source_tracking_mode": source_tracking_mode,
+#         # DTEM 超参
+#         "k2": None,
+#         "tau1": 1.0,
+#         "tau2": 0.1,
+#         "feat_dim": feat_dim,
+#         # 新的持续 token 追踪与屏蔽
+#         "token_map_for_dtem": None,   # [B, T]
+#         "token_mask_for_dtem": None,  # [B, T] bool
+#         # 局部窗口与合并粒度
+#         "window_size": window_size,
+#         "t": t,
+#     }
+
+#     for module in model.modules():
+#         if isinstance(module, (Block, TimmBlock)):
+#             module.__class__ = DTEMBlock
+#             module._tome_info = model._tome_info
+#         elif isinstance(module, (Attention, TimmAttention)):
+#             module.__class__ = DTEMAttention
+#             module._tome_info = model._tome_info
+#             module.patch(model._tome_info["feat_dim"])

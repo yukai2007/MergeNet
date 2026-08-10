@@ -1,0 +1,1110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>MergeNet on CV｜阶段成果与 ImageNet 长训交付说明</title>
+  <style>
+    :root {
+      --paper: #f3f6f2;
+      --surface: #ffffff;
+      --ink: #17211d;
+      --muted: #607069;
+      --line: #dce4de;
+      --green: #176b4d;
+      --green-2: #dff1e8;
+      --blue: #315f98;
+      --blue-2: #e8f0fa;
+      --amber: #966112;
+      --amber-2: #fff2d8;
+      --red: #9a4138;
+      --red-2: #fbe9e6;
+      --shadow: 0 16px 44px rgba(26, 50, 40, .08);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% -5%, rgba(87, 164, 124, .13), transparent 28rem),
+        radial-gradient(circle at 96% 8%, rgba(75, 123, 176, .10), transparent 31rem),
+        var(--paper);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: inherit; }
+
+    code, pre {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    }
+
+    .page {
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 34px 0 72px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 22px;
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: .02em;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      color: var(--ink);
+      font-weight: 750;
+    }
+
+    .brand-mark {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border-radius: 10px;
+      color: #fff;
+      background: linear-gradient(145deg, #176b4d, #3e7ca7);
+      box-shadow: 0 7px 16px rgba(23, 107, 77, .22);
+      font-size: 12px;
+      letter-spacing: -.03em;
+    }
+
+    .hero {
+      overflow: hidden;
+      position: relative;
+      padding: clamp(28px, 5vw, 58px);
+      border: 1px solid rgba(255, 255, 255, .72);
+      border-radius: 28px;
+      color: #f8fffb;
+      background:
+        linear-gradient(122deg, rgba(9, 53, 38, .97), rgba(25, 83, 62, .96) 56%, rgba(39, 84, 119, .94));
+      box-shadow: var(--shadow);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 380px;
+      height: 380px;
+      right: -170px;
+      top: -190px;
+      border: 68px solid rgba(255, 255, 255, .055);
+      border-radius: 50%;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 11px;
+      border: 1px solid rgba(255, 255, 255, .23);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, .08);
+      color: #dff6e9;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #7be2ad;
+      box-shadow: 0 0 0 4px rgba(123, 226, 173, .14);
+    }
+
+    h1 {
+      max-width: 850px;
+      margin: 22px 0 15px;
+      font-size: clamp(34px, 6vw, 64px);
+      line-height: 1.08;
+      letter-spacing: -.045em;
+    }
+
+    .hero-lead {
+      max-width: 880px;
+      margin: 0;
+      color: #dcebe4;
+      font-size: clamp(16px, 2vw, 20px);
+    }
+
+    .hero-verdict {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 12px;
+      align-items: start;
+      max-width: 930px;
+      margin-top: 28px;
+      padding: 16px 18px;
+      border: 1px solid rgba(255, 255, 255, .18);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, .09);
+      backdrop-filter: blur(8px);
+    }
+
+    .hero-verdict strong { color: #93efbd; white-space: nowrap; }
+
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 20px;
+      margin-top: 26px;
+      color: #c9dcd3;
+      font-size: 12px;
+    }
+
+    .jump-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 18px 0 4px;
+    }
+
+    .jump-nav a {
+      padding: 8px 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, .70);
+      text-decoration: none;
+      font-size: 13px;
+    }
+
+    .jump-nav a:hover { color: var(--green); border-color: #a7cbb9; }
+
+    section { margin-top: 24px; }
+
+    .section-card {
+      padding: clamp(22px, 3vw, 34px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, .94);
+      box-shadow: 0 7px 24px rgba(29, 53, 43, .045);
+    }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 18px;
+      margin-bottom: 20px;
+    }
+
+    .kicker {
+      margin: 0 0 5px;
+      color: var(--green);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(24px, 3vw, 34px);
+      line-height: 1.22;
+      letter-spacing: -.025em;
+    }
+
+    h3 {
+      margin: 26px 0 10px;
+      font-size: 18px;
+      line-height: 1.35;
+    }
+
+    p { margin: 9px 0; }
+
+    .muted { color: var(--muted); }
+    .small { font-size: 13px; }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 13px;
+      margin-top: 18px;
+    }
+
+    .metric {
+      min-height: 158px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: linear-gradient(155deg, #fff, #f7faf8);
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .055em;
+      text-transform: uppercase;
+    }
+
+    .metric-value {
+      display: block;
+      margin: 8px 0 2px;
+      color: var(--green);
+      font-size: clamp(28px, 3.2vw, 42px);
+      font-weight: 820;
+      line-height: 1;
+      letter-spacing: -.04em;
+    }
+
+    .metric-note { color: var(--muted); font-size: 13px; line-height: 1.5; }
+
+    .callout {
+      display: grid;
+      grid-template-columns: 34px 1fr;
+      gap: 13px;
+      margin: 18px 0 0;
+      padding: 15px 17px;
+      border: 1px solid #edd7ac;
+      border-radius: 13px;
+      color: #66420e;
+      background: var(--amber-2);
+    }
+
+    .callout.info {
+      border-color: #cad9ec;
+      color: #244d7a;
+      background: var(--blue-2);
+    }
+
+    .callout.danger {
+      border-color: #ecc8c2;
+      color: #78342d;
+      background: var(--red-2);
+    }
+
+    .callout-icon {
+      display: grid;
+      width: 28px;
+      height: 28px;
+      place-items: center;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, .63);
+      font-weight: 850;
+    }
+
+    .callout strong { display: block; margin-bottom: 2px; }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      font-size: 14px;
+    }
+
+    th, td {
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: #4d5e56;
+      background: #f4f7f5;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .035em;
+      white-space: nowrap;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .best { color: var(--green); font-weight: 800; }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .pill.good { color: var(--green); background: var(--green-2); }
+    .pill.warn { color: var(--amber); background: var(--amber-2); }
+    .pill.bad { color: var(--red); background: var(--red-2); }
+    .pill.info { color: var(--blue); background: var(--blue-2); }
+
+    .bar-chart { margin-top: 20px; }
+
+    .bar-row {
+      display: grid;
+      grid-template-columns: minmax(180px, 1.25fr) 3fr 76px;
+      gap: 12px;
+      align-items: center;
+      margin: 12px 0;
+      font-size: 13px;
+    }
+
+    .bar-track {
+      height: 12px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e7ece9;
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #4388bb, #176b4d);
+    }
+
+    .bar-fill.base { background: #9aa8a1; }
+
+    .bar-value {
+      text-align: right;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .route {
+      padding: 19px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fbfcfb;
+    }
+
+    .route h3 { margin: 0 0 8px; }
+    .route ul, .checklist { margin: 10px 0 0; padding-left: 20px; }
+    .route li, .checklist li { margin: 6px 0; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .flow-step {
+      position: relative;
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fafcfb;
+    }
+
+    .flow-step::after {
+      content: "→";
+      position: absolute;
+      right: -11px;
+      top: 50%;
+      z-index: 2;
+      transform: translateY(-50%);
+      color: #8aa098;
+      font-weight: 800;
+    }
+
+    .flow-step:last-child::after { display: none; }
+
+    .step-no {
+      display: inline-grid;
+      width: 26px;
+      height: 26px;
+      place-items: center;
+      border-radius: 8px;
+      color: #fff;
+      background: var(--green);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .flow-step strong { display: block; margin: 9px 0 3px; }
+
+    pre {
+      overflow-x: auto;
+      margin: 14px 0 0;
+      padding: 18px;
+      border: 1px solid #274538;
+      border-radius: 14px;
+      color: #e9f7ef;
+      background: #14241d;
+      font-size: 13px;
+      line-height: 1.65;
+      tab-size: 2;
+    }
+
+    details {
+      margin-top: 12px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fbfcfb;
+    }
+
+    summary { cursor: pointer; font-weight: 750; }
+
+    footer {
+      margin-top: 22px;
+      padding: 20px 4px;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    @media (max-width: 900px) {
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow-step:nth-child(2)::after { display: none; }
+    }
+
+    @media (max-width: 640px) {
+      .page { width: min(100% - 22px, 1180px); padding-top: 16px; }
+      .topbar { align-items: flex-start; }
+      .topbar > span { text-align: right; }
+      .hero { border-radius: 20px; }
+      .hero-verdict { grid-template-columns: 1fr; }
+      .metrics, .two-col, .flow { grid-template-columns: 1fr; }
+      .flow-step::after { display: none; }
+      .bar-row { grid-template-columns: 1fr 62px; }
+      .bar-track { grid-column: 1 / -1; grid-row: 2; }
+      .section-head { align-items: start; flex-direction: column; }
+    }
+
+    @media print {
+      body { background: #fff; }
+      .page { width: 100%; padding: 0; }
+      .hero, .section-card { box-shadow: none; break-inside: avoid; }
+      .jump-nav { display: none; }
+      details { break-inside: avoid; }
+      details > * { display: block; }
+      @page { size: A4; margin: 13mm; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="topbar">
+      <div class="brand"><span class="brand-mark">MN</span> MergeNet / CV</div>
+      <span>内部交付报告 · 2026-08-09</span>
+    </div>
+
+    <header class="hero">
+      <span class="eyebrow"><span class="dot"></span> Evidence-audited handoff</span>
+      <h1>阶段成果已足以进入<br>ImageNet 大规模长训验证</h1>
+      <p class="hero-lead">
+        CIFAR-100 上已经形成可追溯的多随机种子精度结果、明确的压缩—精度取舍，以及接近 DeiT 的最新推理吞吐。
+        当前正确结论是“可交付做规模化验证”，不是“ImageNet 已经验证”或“生产效率已闭环”。
+      </p>
+      <div class="hero-verdict">
+        <strong>交付结论</strong>
+        <span>优先交付 4+8 / λ=4 / window=32 压缩版；先通过完整 preflight，再从头进行 ImageNet 新训练。历史 canonical 主路径是 LocalBlock（unbiased attention）+ DTEMMergeOnly，本次 biased-attention 修复属于兼容路径加固，不改变主结果的前向语义。新训练的原因是更换到 ImageNet-1K 数据、类别空间与训练尺度，而不是历史 CIFAR 主路径被该兼容缺陷污染。</span>
+      </div>
+      <div class="hero-meta">
+        <span>证据截止：2026-08-03</span>
+        <span>数据集：CIFAR-100</span>
+        <span>主协议：scratch · 200 epochs · 224px · patch 8</span>
+        <span>效率设备：4× A100-SXM4-80GB 独立测量</span>
+      </div>
+    </header>
+
+    <nav class="jump-nav" aria-label="报告目录">
+      <a href="#verdict">结论</a>
+      <a href="#accuracy">精度与压缩</a>
+      <a href="#efficiency">效率</a>
+      <a href="#boundary">证据边界</a>
+      <a href="#handoff">ImageNet 交付</a>
+      <a href="#provenance">复现信息</a>
+    </nav>
+
+    <section id="verdict" class="section-card">
+      <div class="section-head">
+        <div>
+          <p class="kicker">Executive verdict</p>
+          <h2>结果可用，但“可用”的范围必须说清</h2>
+        </div>
+        <span class="pill good">Go for ImageNet validation</span>
+      </div>
+
+      <div class="metrics">
+        <article class="metric">
+          <span class="metric-label">精度优先 · 3 seeds</span>
+          <span class="metric-value">71.08%</span>
+          <span class="metric-note">±0.46；6+6、λ=2、w16；保留 392 / 784 patch tokens</span>
+        </article>
+        <article class="metric">
+          <span class="metric-label">压缩优先 · 3 seeds</span>
+          <span class="metric-value">70.60%</span>
+          <span class="metric-note">±0.43；4+8、λ=4、w32；保留 196 / 784 patch tokens</span>
+        </article>
+        <article class="metric">
+          <span class="metric-label">压缩版 fast inference</span>
+          <span class="metric-value">0.893×</span>
+          <span class="metric-note">相对 DeiT 吞吐；1879.9 img/s；checkpoint replay 最大差 0.01 pp</span>
+        </article>
+        <article class="metric">
+          <span class="metric-label">压缩版 fast train microbench</span>
+          <span class="metric-value">0.913×</span>
+          <span class="metric-note">均值；GPU0 明显偏慢，单卡比值范围 0.820–0.961×；未做 200e fast-path 长训</span>
+        </article>
+      </div>
+
+      <div class="callout">
+        <span class="callout-icon">!</span>
+        <div>
+          <strong>不要把最佳准确率与 fast 训练效率拼成一个“联合验证结果”。</strong>
+          71.08% / 70.60% 的训练使用 <code>random_per_sample</code>；0.913× 的 clean microbench 使用
+          <code>alternating_per_layer_fast</code>。后者目前只完成了短基准测试，没有完成对应的 200 epoch 训练。
+        </div>
+      </div>
+    </section>
+
+    <section id="accuracy" class="section-card">
+      <div class="section-head">
+        <div>
+          <p class="kicker">Accuracy × compression</p>
+          <h2>CIFAR-100 主结果</h2>
+        </div>
+        <span class="small muted">均值 ± 样本标准差；Top-1 EMA best</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>模型 / 配置</th>
+              <th>训练 grouping</th>
+              <th class="num">保留 tokens</th>
+              <th class="num">压缩率</th>
+              <th class="num">seed 42</th>
+              <th class="num">seed 43</th>
+              <th class="num">seed 44</th>
+              <th class="num">均值 ± SD</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>DeiT-S/8 · logit KD</td>
+              <td>—</td>
+              <td class="num">784</td>
+              <td class="num">0%</td>
+              <td class="num">68.52</td>
+              <td class="num muted">未跑</td>
+              <td class="num muted">未跑</td>
+              <td class="num">单 seed</td>
+            </tr>
+            <tr>
+              <td><strong>MergeNet 6+6 · λ=2 · w16</strong><br><span class="small muted">精度优先</span></td>
+              <td><code>random_per_sample</code></td>
+              <td class="num">392</td>
+              <td class="num">50.0%</td>
+              <td class="num">71.27</td>
+              <td class="num">71.41</td>
+              <td class="num">70.55</td>
+              <td class="num best">71.08 ± 0.46</td>
+            </tr>
+            <tr>
+              <td><strong>MergeNet 4+8 · λ=4 · w32</strong><br><span class="small muted">压缩 / 交付优先</span></td>
+              <td><code>random_per_sample</code></td>
+              <td class="num">196</td>
+              <td class="num">75.0%</td>
+              <td class="num">70.93</td>
+              <td class="num">70.11</td>
+              <td class="num">70.76</td>
+              <td class="num best">70.60 ± 0.43</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="bar-chart" aria-label="Top-1 准确率对比图">
+        <div class="bar-row">
+          <span>DeiT-S/8 · seed 42</span>
+          <div class="bar-track"><div class="bar-fill base" style="width: 68.52%"></div></div>
+          <span class="bar-value">68.52%</span>
+        </div>
+        <div class="bar-row">
+          <span>MergeNet λ=2 · 3-seed mean</span>
+          <div class="bar-track"><div class="bar-fill" style="width: 71.08%"></div></div>
+          <span class="bar-value">71.08%</span>
+        </div>
+        <div class="bar-row">
+          <span>MergeNet λ=4 / w32 · 3-seed mean</span>
+          <div class="bar-track"><div class="bar-fill" style="width: 70.60%"></div></div>
+          <span class="bar-value">70.60%</span>
+        </div>
+      </div>
+
+      <div class="callout info">
+        <span class="callout-icon">i</span>
+        <div>
+          <strong>如何解读增益</strong>
+          同 seed 42、同 logit-KD 协议下，λ=2 配置相对 DeiT 为 <strong>+2.75 pp</strong>，λ=4 / w32 为
+          <strong>+2.41 pp</strong>。多 seed MergeNet 均值不能与单 seed DeiT 组成统计显著性结论；正式论文级比较仍应补齐 DeiT seeds 43 / 44。
+        </div>
+      </div>
+
+      <div class="callout">
+        <span class="callout-icon">!</span>
+        <div>
+          <strong>历史 CIFAR 运行每个 epoch 都在 test split 上评估，并按其选择 best EMA。</strong>
+          这足以支持当前内部选型，但不属于最终论文级 protocol。后续应划分 validation、冻结 checkpoint 选择规则，再对 test 只评一次。
+        </div>
+      </div>
+
+      <h3>主训练协议</h3>
+      <p class="muted">
+        CIFAR-100、从头训练 200 epochs、输入 224、patch size 8（784 patch tokens）、global batch 200、AdamW、
+        warmup 20 + cosine；Mixup / CutMix / RandAugment / random erasing；EMA 0.9998。logit KD 使用同一 DeiT teacher，
+        权重 1、温度 2。MergeNet 共用 DTEM window 8、feature dim 64、<code>source_trace=center</code>、
+        <code>cls_global=true</code>、metric grad scale 0.1、soft top-k auxiliary 0.05。
+      </p>
+
+      <details>
+        <summary>辅助控制与结论边界</summary>
+        <p class="small muted">
+          无 KD 的单 seed 控制中，DeiT 为 66.53，MergeNet 6+6 / λ=4 / w16 为 69.24（+2.71 pp），支持收益不只来自教师；
+          但该控制同样只有一个 seed。ToMe 对照与历史 resize / warm-start 采用不同协议，只能作为方向性或负面机制证据，
+          不并入主表。这里的“压缩率”指进入 latent encoder 的 patch token 数减少，不等于端到端 FLOPs 同比例下降；
+          cross-attention 仍包含 K×N 计算。另需注意：<code>dtem_window_size=8</code> 是 flattened row-major 序列上的 ±8 邻域，
+          不是 2D 8×8 空间窗；<code>source_trace=center</code> 只用于 center-of-mass 排序，不提供 dense source-aware cross-attention bias。
+          二者都不应在 ImageNet 交付中被静默改成新的算法变体。
+        </p>
+      </details>
+    </section>
+
+    <section id="efficiency" class="section-card">
+      <div class="section-head">
+        <div>
+          <p class="kicker">Clean efficiency</p>
+          <h2>最新 fast path 微基准</h2>
+        </div>
+        <span class="pill info">synthetic · FP16 · batch 50</span>
+      </div>
+
+      <p class="muted">
+        4 张 A100-SXM4-80GB 分别运行；PyTorch 2.6.0 + CUDA 12.4；每项 warmup 20、计时 100 steps。
+        训练项包含 student forward + CE + backward + AdamW；不含 dataloader、数据增强和教师网络。
+        吞吐为四卡独立测量的均值 ± 样本标准差，范围为最小–最大；显存为 peak allocated 均值。
+      </p>
+
+      <h3>训练微基准</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>配置</th>
+              <th class="num">参数量</th>
+              <th class="num">吞吐 img/s</th>
+              <th class="num">范围</th>
+              <th class="num">相对 DeiT</th>
+              <th class="num">batch step</th>
+              <th class="num">峰值显存</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>DeiT-S/8</td>
+              <td class="num">21.709 M</td>
+              <td class="num">543.8 ± 8.7</td>
+              <td class="num">532.0–550.4</td>
+              <td class="num">1.000×</td>
+              <td class="num">92.0 ms</td>
+              <td class="num">6.741 GiB</td>
+            </tr>
+            <tr>
+              <td><strong>MergeNet 4+8 · λ=4 · w32 fast</strong></td>
+              <td class="num">22.701 M</td>
+              <td class="num best">496.3 ± 34.5</td>
+              <td class="num">444.9–518.5</td>
+              <td class="num">0.913×</td>
+              <td class="num">101.1 ms</td>
+              <td class="num best">5.050 GiB · 0.749×</td>
+            </tr>
+            <tr>
+              <td>MergeNet 6+6 · λ=2 · w16 fast</td>
+              <td class="num">22.751 M</td>
+              <td class="num">361.4 ± 5.8</td>
+              <td class="num">352.8–365.2</td>
+              <td class="num">0.665×</td>
+              <td class="num">138.4 ms</td>
+              <td class="num">7.137 GiB · 1.059×</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout danger">
+        <span class="callout-icon">!</span>
+        <div>
+          <strong>λ=4 训练吞吐存在 GPU0 波动，0.913× 暂不应写成高精度承诺。</strong>
+          四张卡的吞吐分别为 444.9 / 511.2 / 518.5 / 510.7 img/s；逐卡相对 DeiT 为
+          0.820 / 0.961 / 0.942 / 0.928×，样本 CV 6.94%。显存结果稳定，推理结果也稳定；训练吞吐建议在交付环境复跑并记录卡序与温度 / 功耗状态。
+        </div>
+      </div>
+
+      <h3>推理微基准</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>配置</th>
+              <th class="num">吞吐 img/s</th>
+              <th class="num">范围</th>
+              <th class="num">相对 DeiT</th>
+              <th class="num">batch step</th>
+              <th class="num">峰值显存</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>DeiT-S/8</td>
+              <td class="num">2104.0 ± 9.5</td>
+              <td class="num">2094.7–2117.0</td>
+              <td class="num">1.000×</td>
+              <td class="num">23.76 ms</td>
+              <td class="num">0.614 GiB</td>
+            </tr>
+            <tr>
+              <td><strong>MergeNet 4+8 · λ=4 · w32 fast</strong></td>
+              <td class="num best">1879.9 ± 4.0</td>
+              <td class="num">1877.4–1885.9</td>
+              <td class="num best">0.893×</td>
+              <td class="num">26.60 ms</td>
+              <td class="num">1.218 GiB · 1.983×</td>
+            </tr>
+            <tr>
+              <td>MergeNet 6+6 · λ=2 · w16 fast</td>
+              <td class="num">1264.7 ± 27.0</td>
+              <td class="num">1224.3–1281.4</td>
+              <td class="num">0.601×</td>
+              <td class="num">39.55 ms</td>
+              <td class="num">1.336 GiB · 2.176×</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="two-col">
+        <article class="route">
+          <span class="pill good">Checkpoint-compatible inference</span>
+          <h3>fast 推理已做全测试集 replay</h3>
+          <ul class="small muted">
+            <li>λ=4 / w32 seed 42：generic 70.91，fast 70.91，预测一致率 1.0000。</li>
+            <li>λ=2 seeds 42 / 43 / 44：Top-1 最大差 0.01 pp，预测一致率 0.9998–1.0000。</li>
+            <li>因此，历史 checkpoint 可用于 fast <em>inference</em> 的精度兼容性说明。</li>
+          </ul>
+          <p class="small muted">replay 是独立全测试集重评估，四舍五入后可与训练期 summary 相差 0.01–0.02 pp；其用途是同一 replay 内的 generic / fast 配对比较。</p>
+        </article>
+        <article class="route">
+          <span class="pill warn">Training not jointly validated</span>
+          <h3>fast 训练仍需新实验</h3>
+          <ul class="small muted">
+            <li>主准确率训练：<code>random_per_sample</code>。</li>
+            <li>fast 微基准：<code>alternating_per_layer_fast</code>。</li>
+            <li>旧、与准确率路径一致的 generic 训练测得 λ=4 为 0.741× DeiT、8.50 GiB（1.26×）。</li>
+          </ul>
+        </article>
+      </div>
+
+      <p class="small muted">
+        未提供经审计的 FLOPs，也没有 batch=1 在线延迟；上表 batch step time 不能替代单样本延迟。参数量方面，λ=4 / λ=2 分别比 DeiT 增加约 4.6% / 4.8%。表中参数量来自 CIFAR-100 head 的 microbench；交付包换成 1000 类 ImageNet head 后分别为 DeiT 22,055,272、λ=4 23,047,784、λ=2 23,097,064，二者差异来自分类头类别数。
+      </p>
+    </section>
+
+    <section id="boundary" class="section-card">
+      <div class="section-head">
+        <div>
+          <p class="kicker">Evidence boundary</p>
+          <h2>哪些话现在可以说，哪些还不能说</h2>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>命题</th>
+              <th>状态</th>
+              <th>当前可用表述</th>
+              <th>不可外推的部分</th>
+              <th>闭环动作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>CIFAR-100 精度</td>
+              <td><span class="pill good">已审计</span></td>
+              <td>两套 MergeNet 配置均有 3-seed、完整 200e 结果。</td>
+              <td>DeiT 主 baseline 只有 seed 42，不能声称统计显著。</td>
+              <td>如用于论文，补 DeiT seeds 43 / 44。</td>
+            </tr>
+            <tr>
+              <td>token 压缩</td>
+              <td><span class="pill good">已验证</span></td>
+              <td>latent 输入由 784 降到 392 / 196，分别减少 50% / 75%。</td>
+              <td>不是端到端 FLOPs 同比例减少；local soft merge 不物理删 token。</td>
+              <td>ImageNet 交付补 profiler FLOPs / wall-clock。</td>
+            </tr>
+            <tr>
+              <td>fast 推理</td>
+              <td><span class="pill good">已做 replay</span></td>
+              <td>旧 checkpoint 在全测试集上基本保持预测，λ=4 吞吐 0.893× DeiT。</td>
+              <td>推理显存仍约 1.98× DeiT；不是全面优于 baseline。</td>
+              <td>在交付机器复跑相同协议。</td>
+            </tr>
+            <tr>
+              <td>fast 训练</td>
+              <td><span class="pill warn">仅 microbench</span></td>
+              <td>λ=4 平均吞吐约 0.91×，peak allocated 约 0.75×。</td>
+              <td>没有 200e 对应训练；GPU0 吞吐异常；不能与 70.60% 合并成一个 joint result。</td>
+              <td>先 parity / smoke / 短曲线，再开长训。</td>
+            </tr>
+            <tr>
+              <td>biased attention 兼容路径</td>
+              <td><span class="pill good">已修复并测试</span></td>
+              <td>BHND→BNHD 与单次 scale 已修复；forward/backward parity、locality 与 caller 测试通过。</td>
+              <td>canonical <code>mergenet_small_cls</code> 使用 LocalBlock + DTEMMergeOnly，不调用该 biased 路径；不能把兼容路径缺陷误写成历史主结果失效。</td>
+              <td>保留回归门禁；ImageNet 因尚未 scale-up 而从头训练并保存代码指纹。</td>
+            </tr>
+            <tr>
+              <td>ImageNet 表现</td>
+              <td><span class="pill bad">尚无结果</span></td>
+              <td>当前证据支持“值得做 ImageNet scale-up”。</td>
+              <td>不能声称 ImageNet 精度、收敛性、吞吐或多机稳定性。</td>
+              <td>按交付包完成 smoke → 短跑 → 300e。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>biased-attention 修复与 canonical 主路径的关系</h3>
+      <div class="callout info">
+        <span class="callout-icon">!</span>
+        <div>
+          <strong>修复是必要的兼容路径 hardening，但不是历史 CIFAR 主结果的语义变更。</strong>
+          交付版已在 <code>biased_local_attention</code> 中把 DTEM 的 BHND 输入显式转换为 FlashAttention 需要的 BNHD，
+          并在 <code>DTEMAttention.forward</code> 去掉 caller 侧对 q 的预缩放，使
+          <code>softmax_scale = 1 / sqrt(head_dim)</code> 只生效一次。交付测试已覆盖 BHND / BNHD、N&gt;H / N&lt;H、
+          forward / backward parity、局部性和 DTEM caller；canonical CUDA forward / backward 与有限梯度 smoke 也已通过。
+          历史主模型实际走 LocalBlock 的 unbiased attention 与 DTEMMergeOnly，因此 CIFAR 结果仍可作为同一 canonical 架构的 scale-up 证据。
+          ImageNet 必须 fresh train，是因为这是尚未做过的新数据集 / 新类别空间 / 新规模验证，而不是为了“修复后重现”历史 CIFAR 数值。
+        </div>
+      </div>
+
+      <details>
+        <summary>本报告排除的实验</summary>
+        <p class="small muted">
+          不纳入主结论：早期未完成 / 短跑目录；错误 ImageNet normalization 的 grouping 评估；smoke256、batch16 preliminary、
+          zero-train-step preflight；兼容 DTEMAttention 路径在 BHND layout 修正前的 implementation-check-only 记录；旧 800e warm-start 中断结果；不同协议的历史 resize fine-tune；
+          post-hoc 4+8 ToMe 机制负例；以及首轮包含慢 DeiT 卡异常的 2026-08-02 efficiency 数据。
+        </p>
+      </details>
+    </section>
+
+    <section id="handoff" class="section-card">
+      <div class="section-head">
+        <div>
+          <p class="kicker">ImageNet handoff</p>
+          <h2>给学长的长训执行口径</h2>
+        </div>
+        <span class="pill warn">ImageNet new training required</span>
+      </div>
+
+      <div class="two-col">
+        <article class="route">
+          <span class="pill good">默认候选</span>
+          <h3>4+8 · λ=4 · window 32</h3>
+          <ul class="small muted">
+            <li>CIFAR-100：70.60 ± 0.43，保留 196 / 784 patch tokens。</li>
+            <li>fast inference：0.893× DeiT，精度 replay 最大差 0.01 pp。</li>
+            <li>最适合作为“压缩与可训练性平衡”的首个 ImageNet 规模化候选。</li>
+          </ul>
+        </article>
+        <article class="route">
+          <span class="pill info">次级候选</span>
+          <h3>6+6 · λ=2 · window 16</h3>
+          <ul class="small muted">
+            <li>CIFAR-100：71.08 ± 0.46，保留 392 / 784 patch tokens。</li>
+            <li>精度更高，但 clean inference 仅 0.601× DeiT、推理显存 2.18×。</li>
+            <li>适合作为 accuracy-first 对照，不建议作为唯一长训任务。</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="flow" aria-label="长训门禁流程">
+        <article class="flow-step">
+          <span class="step-no">1</span>
+          <strong>代码与环境锁定</strong>
+          <span class="small muted">兼容路径修复已过 parity；记录 commit、依赖、GPU 与数据指纹。</span>
+        </article>
+        <article class="flow-step">
+          <span class="step-no">2</span>
+          <strong>目标机完整 preflight</strong>
+          <span class="small muted">重跑数据、依赖、parity 与 canonical model smoke；任一失败都禁止长训。</span>
+        </article>
+        <article class="flow-step">
+          <span class="step-no">3</span>
+          <strong>Smoke + 短曲线</strong>
+          <span class="small muted">单卡小步数、8 卡短跑；检查 loss、NaN、吞吐、显存与 resume。</span>
+        </article>
+        <article class="flow-step">
+          <span class="step-no">4</span>
+          <strong>ImageNet 300e</strong>
+          <span class="small muted">通过门禁后再开长训；保留 best / last、日志与环境清单。</span>
+        </article>
+      </div>
+
+      <h3>可复制的预检与启动命令</h3>
+      <p class="small muted">
+        从仓库根目录执行。先把前两行替换为目标机的数据与输出目录；完整变量、resume 与回退说明见
+        <a href="../deliverables/imagenet_longtrain_v1/README.md"><code>deliverables/imagenet_longtrain_v1/README.md</code></a>。
+      </p>
+      <pre><code>cd deliverables/imagenet_longtrain_v1
+
+# 目标机只需修改这两个值
+export IMAGENET_ROOT=REPLACE_WITH_IMAGENET_ROOT
+export TRAIN_OUTPUT_ROOT=REPLACE_WITH_OUTPUT_ROOT
+
+# 1) 完整 preflight：数据、依赖、配置、attention parity、canonical model smoke
+DATA_DIR="$IMAGENET_ROOT" \
+OUTPUT_DIR="$TRAIN_OUTPUT_ROOT" \
+GPUS=0,1,2,3,4,5,6,7 \
+bash scripts/preflight_imagenet.sh configs/mergenet_lambda4.yaml
+
+# 2) λ=4 主候选；launcher 默认会再次执行 preflight
+DATA_DIR="$IMAGENET_ROOT" \
+OUTPUT_DIR="$TRAIN_OUTPUT_ROOT" \
+GPUS=0,1,2,3,4,5,6,7 \
+RUN_NAME=in1k300_mergenet_lambda4_seed42 \
+bash scripts/train_imagenet_300e.sh configs/mergenet_lambda4.yaml
+
+# 3) 公平的 DeiT-S/8 matched baseline
+DATA_DIR="$IMAGENET_ROOT" \
+OUTPUT_DIR="$TRAIN_OUTPUT_ROOT" \
+GPUS=0,1,2,3,4,5,6,7 \
+RUN_NAME=in1k300_deit_small_p8_seed42 \
+bash scripts/train_imagenet_300e.sh configs/deit_small_p8_baseline.yaml</code></pre>
+
+      <h3>开跑前检查清单</h3>
+      <ul class="checklist">
+        <li>确认数据为 ImageNet-1K、1000 类，train / val 目录与样本数正确；不要沿用 CIFAR normalization。</li>
+        <li>若启用 logit KD，必须使用匹配 ImageNet-1K 类别空间的 teacher；CIFAR teacher checkpoint 不可复用。</li>
+        <li>确认 global batch、学习率缩放、gradient accumulation、AMP、EMA 与 resume 行为。</li>
+        <li>先比较 DeiT 与 MergeNet 的单步 loss / gradient、50–200 step 吞吐和 peak memory，再进入长训。</li>
+        <li>保存配置、代码 commit / dirty diff、环境版本、每 epoch 指标、best / last checkpoint 与 sha256。</li>
+        <li>报告 ImageNet 结果时，将训练吞吐、验证吞吐、显存、参数量与 FLOPs 分开；不要以 latent token 压缩率替代 FLOPs。</li>
+      </ul>
+    </section>
+
+    <section id="provenance" class="section-card">
+      <div class="section-head">
+        <div>
+          <p class="kicker">Reproducibility</p>
+          <h2>结果来源与可追溯性</h2>
+        </div>
+      </div>
+
+      <p class="muted">
+        2026-07-25 主队列完成 27 个状态条目；2026-07-28 补齐 15 个 200e 多 seed 运行，共形成 42 个完整 200e 运行。
+        新增 15 个运行合计 3000 epochs，报告记录 117.62 GPU-hours。主实验保存了 args、summary、best / last checkpoint，
+        campaign manifest 记录训练时 git head、代码 sha256、dirty diff、几何 schedule 与环境。
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>资产</th>
+              <th>用途</th>
+              <th>相对位置 / 标识</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>本次交付包</td>
+              <td>ImageNet parity、smoke 与长训入口</td>
+              <td><a href="../deliverables/imagenet_longtrain_v1/README.md"><code>deliverables/imagenet_longtrain_v1/README.md</code></a></td>
+            </tr>
+            <tr>
+              <td>组会证据索引</td>
+              <td>历史结果定位与边界说明</td>
+              <td><a href="evidence/证据索引.md"><code>reports/evidence/证据索引.md</code></a></td>
+            </tr>
+            <tr>
+              <td>CV 判断文档</td>
+              <td>截至 2026-08-02 的结论快照</td>
+              <td><a href="evidence/CV结果与长序列判断_20260802.md"><code>reports/evidence/CV结果与长序列判断_20260802.md</code></a></td>
+            </tr>
+            <tr>
+              <td>训练 run family</td>
+              <td>3-seed accuracy-first / compression-first</td>
+              <td><code>c100_cv_sweetpoint_…seed42_20260725</code>；<code>c100_cv_repl_…seed43/44_20260728</code></td>
+            </tr>
+            <tr>
+              <td>fast-path replay</td>
+              <td>旧 checkpoint 推理兼容性</td>
+              <td><code>dtem_fastpath_acc_20260802</code></td>
+            </tr>
+            <tr>
+              <td>clean microbench</td>
+              <td>4×A100 独立效率测量</td>
+              <td><code>dtem_fastpath_efficiency_clean_20260803</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <details>
+        <summary>关键 checkpoint sha256（历史 CIFAR 实验）</summary>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>配置 / seed</th><th>model_best.pth.tar sha256</th></tr></thead>
+            <tbody>
+              <tr><td>6+6 λ2 w16 / 42</td><td><code>1849aa443aba79efeabdf6c32a6c6d64ca46b2635e0909465b430f5acd421b6c</code></td></tr>
+              <tr><td>6+6 λ2 w16 / 43</td><td><code>d6965ac2b1aef85c746411481df8fa67682b58e9bcad2ce0deb7ca47d7c0cc0f</code></td></tr>
+              <tr><td>6+6 λ2 w16 / 44</td><td><code>0e4e1ebacca1ae4c87074ae026a0f812e882fdeb753bb40d26f454accc873840</code></td></tr>
+              <tr><td>4+8 λ4 w32 / 42</td><td><code>6ba572dd62af9cfa1072a6c3b39e62b47f37a0ccdc26084e50129df6b13c1425</code></td></tr>
+              <tr><td>4+8 λ4 w32 / 43</td><td><code>682b1bf6cf16b2270dbd93619e989e3836063726918798214b43f4443a52292d</code></td></tr>
+              <tr><td>4+8 λ4 w32 / 44</td><td><code>9f10e3b83e00dfa6abf94899aa9a3777d49b4262f72893d2df9c89ae266830b3</code></td></tr>
+              <tr><td>DeiT-S/8 logit-KD / 42</td><td><code>76d8e8766ef9b1412eb2b07539941c0f3f23483c4aa06300ae3ac34845234691</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <footer>
+      MergeNet on CV · 阶段成果与 ImageNet 长训交付说明 · 生成于 2026-08-09<br>
+      本文件不依赖外部 CDN、字体、脚本或 raw 数据，可离线打开与打印。
+    </footer>
+  </main>
+</body>
+</html>
