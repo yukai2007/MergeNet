@@ -15,8 +15,7 @@
 | 路径 | 用途 |
 |---|---|
 | `opentome/__init__.py`, `opentome/version.py` | 最小包入口与上游版本信息。 |
-| `opentome/models/__init__.py` | CV 模型导出；可跳过不随包交付的 NLP 可选栈。 |
-| `opentome/models/deit/` | DeiT-S/8 对照模型注册与实现。 |
+| `opentome/models/__init__.py` | MergeNet 模型导出；DeiT-S/8 对照由锁定的上游 timm 提供。 |
 | `opentome/models/mergenet/` | `mergenet_small_cls` 分类模型、4+8/6+6 几何及路由逻辑。 |
 | `opentome/timm/attention.py` | 通用 attention 辅助实现。 |
 | `opentome/timm/bias_local_attn.py` | 有偏/无偏局部 FlashAttention，显式支持 BHND/BNHD 布局并保证只缩放一次。 |

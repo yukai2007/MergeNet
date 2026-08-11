@@ -288,8 +288,6 @@ def _load_initial_checkpoint(model, path, branch='', map_location='cpu'):
 USE_OLD_MERGENET = os.getenv("OPENTOME_MERGENET_IMPL", "new").lower() in {"old", "model_old", "legacy"}
 USE_TOME_MERGENET = os.getenv("OPENTOME_MERGENET_IMPL", "new").lower() in {"tome", "model_tome"}
 
-import opentome.models.deit
-from opentome.models.deit.deit import deit_s, deit_s_extend  # Import to register models
 if USE_OLD_MERGENET or USE_TOME_MERGENET:
     raise RuntimeError(
         "Legacy/ToMe ablation implementations are not included in the "
@@ -833,6 +831,38 @@ def _option_was_provided(tokens, option):
     return any(token == option or token.startswith(option + '=') for token in tokens)
 
 
+def _is_tome_family_model(model_name):
+    normalized = str(model_name).lower()
+    return (
+        'hybridtome' in normalized
+        or 'mergenet' in normalized
+        or 'tome' in normalized
+        or 'ablation' in normalized
+        or 'additive' in normalized
+    )
+
+
+def _validate_shipped_model_options(args):
+    """Refuse optional MergeNet modes deliberately absent from this handoff."""
+    if not _is_tome_family_model(args.model):
+        return
+    if args.pretrained:
+        raise ValueError(
+            "This ImageNet handoff does not include the historical MergeNet/ToMe "
+            "pretrained-weight loader. Use --initial_checkpoint for a local checkpoint "
+            "or train from scratch with pretrained: false."
+        )
+    if (
+        args.lr_local is not None
+        and args.lr_local != args.lr
+        and not args.twin_ema_local_latent
+    ):
+        raise ValueError(
+            "This ImageNet handoff does not include the historical MergeNet/ToMe "
+            "differential-lr optimizer. Keep --lr_local equal to --lr (or omit it)."
+        )
+
+
 def _parse_args():
     # Do we have a config file to parse?
     args_config, remaining = config_parser.parse_known_args()
@@ -868,6 +898,7 @@ def _parse_args():
     # The main arg parser parses the rest of the args, the usual
     # defaults will have been overridden if config file specified.
     args = parser.parse_args(remaining)
+    _validate_shipped_model_options(args)
     model_name_lower = args.model.lower()
     is_canonical_mergenet = model_name_lower in {
         'mergenet_small_cls',
@@ -1691,13 +1722,7 @@ def main():
         'mergenet_small_cls_dual_ab',
         'hybridtomevit_small_cls_dual_ab',
     }
-    is_tome_family = (
-        'hybridtome' in model_name_lower
-        or 'mergenet' in model_name_lower
-        or 'tome' in model_name_lower
-        or 'ablation' in model_name_lower
-        or 'additive' in model_name_lower
-    )
+    is_tome_family = _is_tome_family_model(model_name_lower)
 
     use_softkmax = args.use_softkmax
     if use_softkmax is None:

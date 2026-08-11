@@ -3,7 +3,9 @@
 
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +21,11 @@ def collect(loader_len, update_freq):
         trainer._accumulation_step(index, loader_len, update_freq)
         for index in range(loader_len)
     ]
+
+
+def parse_cli(*tokens):
+    with patch.object(sys, "argv", [str(TRAINER), *tokens]):
+        return trainer._parse_args()[0]
 
 
 def main():
@@ -59,6 +66,30 @@ def main():
     assert not trainer._batch_mixup_is_active(disabled_mixup, host_args, loader_off)
     assert trainer._batch_mixup_is_active(None, prefetch_args, loader_on)
     assert not trainer._batch_mixup_is_active(None, prefetch_args, loader_off)
+
+    # The trimmed handoff must reject only the unavailable MergeNet/ToMe modes,
+    # while preserving the upstream timm baseline's legitimate --pretrained API.
+    assert parse_cli('--model', 'deit_small_patch16_224', '--pretrained').pretrained
+    assert parse_cli(
+        '--model', 'mergenet_small_cls', '--lr', '0.001', '--lr_local', '0.001'
+    ).lr_local == 0.001
+    assert parse_cli(
+        '--model', 'mergenet_small_cls', '--lr', '0.001', '--lr_local', '0.0005',
+        '--twin_ema_local_latent'
+    ).lr_local == 0.0005
+    for tokens, expected in (
+        (('--model', 'mergenet_small_cls', '--pretrained'), 'pretrained-weight loader'),
+        (
+            ('--model', 'mergenet_small_cls', '--lr', '0.001', '--lr_local', '0.0005'),
+            'differential-lr optimizer',
+        ),
+    ):
+        try:
+            parse_cli(*tokens)
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f'expected trimmed-handoff guard for {tokens!r}')
 
     print("ACCUMULATION_AND_MIXUP_STATE_TEST_PASS")
 

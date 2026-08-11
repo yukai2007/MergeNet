@@ -1,9 +1,8 @@
-"""CV model registrations included in the ImageNet delivery."""
+"""MergeNet registrations included in the ImageNet delivery.
 
-from opentome.models.deit.deit import DeiTModel, deit_s, deit_s_extend
+The matched DeiT baseline is provided by the pinned upstream timm package.
+"""
+
 from opentome.models.mergenet.model import HybridToMeModel
 
-__all__ = [
-    'DeiTModel', 'deit_s', 'deit_s_extend',
-    'HybridToMeModel',
-]
+__all__ = ['HybridToMeModel']

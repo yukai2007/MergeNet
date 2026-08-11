@@ -4,7 +4,6 @@ from .model import (
     HybridToMeModel,
     hybridtomevit_small_cls,
     hybridtomevit_small_cls_branch_a,
-    mergenet_p16_loe4_pool2_small_cls,
     mergenet_small_cls,
     mergenet_small_cls_dual_ab,
 )
@@ -13,7 +12,6 @@ __all__ = [
     "HybridToMeModel",
     "CLSHybridToMeModel",
     "CLSDualBranchHybridToMeModel",
-    "mergenet_p16_loe4_pool2_small_cls",
     "mergenet_small_cls",
     "mergenet_small_cls_dual_ab",
     "hybridtomevit_small_cls",

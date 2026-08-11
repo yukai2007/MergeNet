@@ -22,6 +22,10 @@
 - 修正 conda-forge 可解析的 Ninja 锁定版本为 `1.11.1`。
 - `ALLOW_EXISTING_RUN_DIR=1` 现在只允许顶层普通 `launcher_*.log`；scratch
   或 auto-without-last 遇到任意 checkpoint/model artifact 都会无条件失败。
+- 删除未交付的 p16 pooling 消融、自定义 DeiT wrapper 及模型文件内 dummy
+  forward；对缺少随包实现的 MergeNet/ToMe `--pretrained` 与差分
+  `--lr_local` 显式 fail-closed。正式三份 YAML 均不触发这些门禁；原生 timm
+  DeiT 的 `--pretrained` 行为不受影响。
 
 其中 biased FlashAttention 修复属于兼容路径加固：canonical
 `mergenet_small_cls` 的模块树是 `LocalBlock`（unbiased attention）+

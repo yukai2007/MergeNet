@@ -114,6 +114,15 @@ state. To change any of those settings, create and preflight a new YAML or use
 the documented launcher variable (`DATA_DIR`, `OUTPUT_DIR`, `RUN_NAME`,
 `RESUME`, `BATCH_SIZE`, `UPDATE_FREQ`, or `VAL_BATCH_SIZE`).
 
+The three formal YAML files train from scratch (`pretrained: false`). This
+trimmed handoff deliberately excludes MergeNet/ToMe's historical pretrained
+loader and differential-local-LR optimizer: a MergeNet/ToMe invocation with
+`--pretrained`, or with `--lr_local` different from `--lr`, fails before model
+construction. Use `--initial_checkpoint` for a local checkpoint and keep a
+single learning rate. The pinned upstream timm DeiT baseline retains its own
+`--pretrained` support, although the formal baseline protocol also starts from
+scratch.
+
 All delivered YAML files explicitly keep `no_prefetcher: true`, which uses the verified host-side Mixup path. The optional trainer flag `--prefetcher` enables timm's CUDA prefetcher/FastCollateMixup path; use it only after an additional short smoke run confirms finite loss and correct soft-target handling on the target environment.
 
 ## 5. Resume and outputs
