@@ -248,6 +248,39 @@ env -u CUDA_VISIBLE_DEVICES -u PYTHONOPTIMIZE \
 
 `--strict-final-release`（别名 `--require-release-go`）仅在主性能 gate PASS 且 30/30 checkpoint parity 全部有效并 PASS 时返回 0/`READY`；缺失或非法证据返回 2/`INCOMPLETE`；任何已验证的 mandatory failure 返回 3/`NO_GO`。聚合器会重新计算 top-1、计数和 gate，并重新散列当前 checkpoint/data/runtime，不能靠修改结果 JSON 绕过。
 
+## 最终汇报发布（只在严格聚合完成后）
+
+最终汇报 builder 同时读取 `aggregate_results.json`、`aggregate_results.csv` 和
+`aggregate_results.md`。JSON 是权威全量证据，builder 会独立复核其中 45 项精度
+矩阵、8 份正式效率证据、预注册 λ4 `PASS|FAIL`、30 份无 missing / invalid 的
+checkpoint parity，以及最终 `READY|NO_GO`。CSV / Markdown 是同一 JSON 经锁定
+`aggregate_results.py` renderer 生成的 canonical projections；builder 锁定 renderer
+SHA-256 并重渲染，要求两份输入与预期 UTF-8 字节（包括末尾换行）完全一致。
+任一证据不完整、renderer 漂移或 projection 任一字节不一致都以状态码 2 拒绝写入。
+
+先做只读检查：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+/usr/bin/python3 experiments/cifar_resize_20260810/build_final_report.py \
+  --aggregate-dir /path/to/campaign/aggregate \
+  --repo-root /path/to/clean/release/worktree \
+  --check-only
+```
+
+只读检查返回 0 后，去掉 `--check-only` 才会原子写入独立最终 HTML、复制三份
+aggregate 到 `reports/evidence/cifar_resize_20260810/`，并更新根 README、证据索引
+和 λ4 定位文档。`NO_GO` 是允许发布的完整科学结论；`INCOMPLETE` 不是。发布过程
+会在落盘前后重验输入 hash，并在异常时回滚，不修改 campaign 或 aggregator。
+
+CPU-only fixture：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+/usr/bin/python3 -m unittest -v \
+  experiments/cifar_resize_20260810/test_build_final_report.py
+```
+
 ## 恢复与完成判据
 
 每个 job 固定落在：
@@ -282,5 +315,7 @@ master 被中断后，用同一条正式启动命令即可恢复；snapshot 和�
 - [aggregate_results.py](aggregate_results.py)：partial/final 准确率与效率证据聚合、预注册 gate 判定。
 - [post_training_parity.py](post_training_parity.py)：30 个 epoch-199 EMA checkpoint 的全量 CIFAR-100 generic/fast 最终发布门禁。
 - [test_post_training_parity.py](test_post_training_parity.py)：CPU-only matrix、边界、resume identity 与聚合 fail-closed fixtures。
+- [build_final_report.py](build_final_report.py)：只消费严格最终 aggregate，原子生成最终 HTML、证据包和发布文档链接。
+- [test_build_final_report.py](test_build_final_report.py)：READY / NO_GO、三格式漂移、缺失 parity、幂等与 fail-closed 发布 fixtures。
 
 在 45 个准确率任务和 8 份效率矩阵全部完成前，不应把这轮实验描述为“已经证明 resize scale-up 有效”；即使主实验 PASS，在 30/30 checkpoint parity 全部通过前也不能交付为 final-release-ready。
