@@ -6,7 +6,7 @@
 - 上游许可：Apache License 2.0；原始源码版权头与完整 `LICENSE` 均保留。
 - 开发分支锚点：`mergenet_on_cifar_work`。
 - 最近的 Git 基线提交：`b6cd1b4ea76148127e30be4a650e0251fe757015`。
-- 交付标识：`imagenet_longtrain_v1`，整理日期 2026-08-09。
+- 交付标识：`imagenet_longtrain_v1`，整理日期 2026-08-09；论文规模预训练入口与报告口径更新于 2026-08-14。
 
 该提交只用于追溯开发起点。交付包还包含在该基线之后完成并通过回归测试的 ImageNet 长训修复，因此它是一个经过裁剪的发布快照，不是上述提交的逐字节导出。最终交付仓库的提交 SHA 才是本包的完整内容标识。
 
@@ -35,6 +35,7 @@
 | `configs/deit_small_p8_baseline.yaml` | 300e DeiT-S/8 对照。 |
 | `configs/mergenet_lambda4.yaml` | 推荐主候选：p8、4+8、lambda=4、window 32、fast eval grouping。 |
 | `configs/mergenet_lambda2.yaml` | 保守回退：p8、6+6、lambda=2、window 16。 |
+| `scripts/pretrain_imagenet_300e.sh` | 论文规模 ImageNet-1K 主入口；固定选择 lambda4 canonical 300e 协议，并将执行委托给受审计 launcher。 |
 | `scripts/train_imagenet_300e.sh` | 无本机绝对路径的单机多卡 `torchrun` 启动器；负责批量/累积、resume，以及 checkpoint-safe 的输出目录保护。 |
 | `scripts/gpu_visibility.sh` | launcher 与独立 preflight 共用的 `GPUS` 合法性、去重及 `CUDA_VISIBLE_DEVICES` 映射。 |
 | `scripts/preflight_imagenet.sh` | 数据、版本、CUDA、FlashAttention、配置与五项回归测试门禁。 |

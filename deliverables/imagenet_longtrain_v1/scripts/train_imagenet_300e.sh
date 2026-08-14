@@ -69,7 +69,8 @@ variant=$(basename "${CONFIG}")
 variant=${variant%.yaml}
 variant=${variant%.yml}
 RUN_NAME="${RUN_NAME:-in1k300_${variant}_seed42}"
-[[ "${RUN_NAME}" =~ ^[A-Za-z0-9._-]+$ ]] || die 'RUN_NAME may contain only letters, digits, dot, underscore, and hyphen'
+[[ "${RUN_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+  || die 'RUN_NAME must start with a letter or digit and contain only letters, digits, dot, underscore, and hyphen'
 
 configure_gpu_visibility || exit $?
 

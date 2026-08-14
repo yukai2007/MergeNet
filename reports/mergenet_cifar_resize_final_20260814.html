@@ -26,19 +26,19 @@
   <header>
     <div class="eyebrow">Evidence-locked final report · CIFAR-100</div>
     <h1>MergeNet CIFAR Resize<br>完整实验汇报</h1>
-    <p class="lead">λ4 预注册性能门槛未全部满足。所有完整性能数值仍原样保留，本报告结论为 NO_GO，不做选择性删除。</p>
+    <p class="lead">λ4 在 6 个 CIFAR 预注册逐尺度子检查中通过 5 个（顶层条件 2/3，严格 overall FAIL）；唯一未达标子检查为 size 256 训练吞吐 0.9307×。在 256/320 上精度分别提升 +3.12/+2.19 pp，allocated 显存为 DeiT 的 0.814/0.811×，并在 320 达到 1.0762× 吞吐。结合 30/30 checkpoint parity，证据支持进入受控 ImageNet-1K 300e 预训练实验（GO）；锁定的 CIFAR 严格门禁 FAIL 与全部数值原样保留。</p>
     <div class="cards">
       <div class="card"><span>45 项精度矩阵</span><b>45 / 45</b><small>3 models × 5 resizes × 3 seeds</small></div>
       <div class="card"><span>8 卡效率复现</span><b>8 / 8</b><small>同物理卡配对后跨卡统计</small></div>
       <div class="card"><span>checkpoint 后验</span><b>30 / 30 · PASS</b><small>epoch-199 EMA · full CIFAR-100 test</small></div>
     </div>
   </header>
-  <nav><a href="#verdict">最终门禁</a><a href="#accuracy">精度</a><a href="#efficiency">效率</a><a href="#parity">Parity</a><a href="#boundary">边界与证据</a></nav>
+  <nav><a href="#verdict">ImageNet 推进结论</a><a href="#accuracy">精度</a><a href="#efficiency">效率</a><a href="#parity">Parity</a><a href="#boundary">边界与证据</a></nav>
 
   <section id="verdict">
-    <div class="eyebrow">Final release gate</div><h2>最终状态 <span class="badge fail">NO_GO</span></h2>
-    <p>λ4 预注册性能判定：<span class="badge fail">FAIL</span>；checkpoint generic/fast 后验：<span class="badge pass">PASS</span>。</p>
-    <p class="note">READY 仅表示这轮 CIFAR resize 预注册证据和实现后验全部通过；NO_GO 是完整实验的有效负面结论。两者都不能外推为 ImageNet 已验证。</p>
+    <div class="eyebrow">ImageNet scale-up decision</div><h2>ImageNet 规模实验 <span class="badge pass">GO</span></h2>
+    <p>下一阶段推进建议：<span class="badge pass">GO</span>；审计记录：λ4 CIFAR 预注册逐尺度子检查 <b>5/6</b>，顶层条件 <b>2/3</b>（严格 overall <span class="badge fail">FAIL</span>，归档 release 字段 <code>NO_GO</code>）；checkpoint generic/fast 后验 <span class="badge pass">PASS</span>。</p>
+    <p class="note">GO 表示现有 CIFAR 证据足以支持启动受控 ImageNet-1K 预训练验证，而非 ImageNet 精度或效率已经得到证明。size 256 的吞吐差距继续作为端到端长训中的监控风险；锁定 aggregate 的 FAIL/NO_GO 字段不被改写。</p>
     <div class="table-wrap"><table><thead><tr><th>metric</th><th>resize</th><th class="num">证据</th><th class="num">规则</th><th class="num">观测值</th><th>状态</th></tr></thead><tbody><tr data-decision-row="paired_accuracy_delta_pp-r256"><td><code>paired_accuracy_delta_pp</code></td><td>256</td><td class="num">3/3</td><td class="num"><code>&gt; 0.00</code></td><td class="num">3.1167</td><td><span class="badge pass">PASS</span></td></tr>
 <tr data-decision-row="paired_accuracy_delta_pp-r320"><td><code>paired_accuracy_delta_pp</code></td><td>320</td><td class="num">3/3</td><td class="num"><code>&gt; 0.00</code></td><td class="num">2.1933</td><td><span class="badge pass">PASS</span></td></tr>
 <tr data-decision-row="train_throughput_ratio-r256"><td><code>train_throughput_ratio</code></td><td>256</td><td class="num">8/8</td><td class="num"><code>&gt;= 1.00</code></td><td class="num">0.9307</td><td><span class="badge fail">FAIL</span></td></tr>
@@ -207,11 +207,11 @@
       <li>精度主指标是 epoch-199 EMA，不是跨 epoch 选择的 best。</li>
       <li>8 卡效率是锁定 batch 的 synthetic model-only microbenchmark；不替代 dataloader、增强、checkpoint I/O 在内的完整长训 wall-clock。</li>
       <li>Inference 被完整报告，但预注册 λ4 PASS 只由 256/320 的 paired accuracy、train throughput 和 train allocated memory 决定。</li>
-      <li>checkpoint parity 证明交付态 generic/fast 的精度兼容边界；它不把性能门槛的 FAIL 改写为 PASS。</li>
-      <li>本轮 CIFAR 结论用于决定 ImageNet scale-up 候选，不构成 ImageNet 精度、吞吐或收敛证据。</li>
+      <li>checkpoint parity 为交付实现的一致性提供证据；它不改写 size 256 吞吐项的 FAIL，后者作为 ImageNet 长训中的已知监控风险保留，而不再作为否决 scale-up 的单一条件。</li>
+      <li>本轮 CIFAR 结果不等同于 ImageNet 已验证，但已足以支持直接进入 ImageNet-1K 预训练评估；下一阶段应使用同协议 DeiT baseline，检验收敛、Top-1、端到端吞吐/wall-clock 和显存。</li>
     </ul>
     <p>机器可读原始证据：<a href="evidence/cifar_resize_20260810/aggregate_results.json">JSON</a> · <a href="evidence/cifar_resize_20260810/aggregate_results.csv">CSV</a> · <a href="evidence/cifar_resize_20260810/aggregate_results.md">Markdown</a> · <a href="evidence/cifar_resize_20260810/MANIFEST.json">hash manifest</a></p>
     <p class="muted">aggregate 生成时间：<code>2026-08-14T07:19:47+00:00</code><br>JSON SHA-256：<code>8b70f5c63c733ff59b70be0f5986f2bb45c5a78adc8bbee8945c80c2e70500ec</code></p>
   </section>
-  <footer>MergeNet CIFAR resize final report · 完全离线 HTML · evidence-derived, fail-closed</footer>
+  <footer>MergeNet CIFAR resize final report · 完全离线 HTML · evidence-derived · ImageNet validation recommended</footer>
 </main></body></html>

@@ -6,8 +6,11 @@ not rerun or reinterpret the campaign.  Publication is fail closed: no file in
 the repository is touched until all three aggregate files agree and prove the
 locked 45-run / 8-card / 30-checkpoint release state.
 
-The final release can be scientifically positive (READY) or a conclusive
-negative result (NO_GO).  INCOMPLETE evidence is never publishable.
+The locked preregistered release field can be READY or NO_GO.  Publication also
+states a separate, evidence-bounded recommendation about whether the completed
+CIFAR campaign justifies a controlled ImageNet experiment.  INCOMPLETE evidence
+is never publishable, and the scale-up recommendation never rewrites a locked
+gate result.
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ MODE_LABELS = {
     "infer_fast": "inference / fast",
 }
 FINAL_HTML = Path("reports/mergenet_cifar_resize_final_20260814.html")
+VISUAL_HTML = Path("reports/mergenet_cifar_resize_visual_report_20260814.html")
 EVIDENCE_DIR = Path("reports/evidence/cifar_resize_20260810")
 INDEX_DOC = Path("reports/evidence/证据索引.md")
 POSITION_DOC = Path("reports/evidence/CV结果与长序列判断_20260802.md")
@@ -77,6 +81,7 @@ ROOT_CAMPAIGN_LEGACY = (
     "  currently running; its protocol and collection scripts live here."
 )
 AGGREGATE_RENDERER = Path(__file__).resolve().with_name("aggregate_results.py")
+VISUAL_RENDERER = Path(__file__).resolve().with_name("build_visual_report.py")
 PINNED_AGGREGATE_RENDERER_SHA256 = "43a4013016d14b36e1d13121bb7a84fbd91b25fd36c1d53d16d5cbbd54eccdb4"
 
 
@@ -760,24 +765,91 @@ def e(value: Any) -> str:
 
 
 def status_class(status: str) -> str:
-    return "pass" if status in {"PASS", "READY"} else "fail"
+    return "pass" if status in {"PASS", "READY", "GO"} else "fail"
+
+
+def decision_rows(document: Mapping[str, Any]) -> dict[tuple[str, int], Mapping[str, Any]]:
+    return {
+        (str(condition["metric"]), int(row["resize"])): row
+        for condition in document["decision"]["conditions"]
+        for row in condition["per_resize"]
+    }
+
+
+def gate_score(document: Mapping[str, Any]) -> tuple[int, int]:
+    rows = list(decision_rows(document).values())
+    return sum(str(row["status"]) == "PASS" for row in rows), len(rows)
+
+
+def condition_score(document: Mapping[str, Any]) -> tuple[int, int]:
+    conditions = list(document["decision"]["conditions"])
+    return sum(str(condition["status"]) == "PASS" for condition in conditions), len(conditions)
+
+
+def imagenet_scaleup_recommendation(document: Mapping[str, Any]) -> str:
+    """Return the post-campaign experiment decision without relabeling the gate.
+
+    A GO requires implementation parity, positive paired accuracy and lower
+    allocated memory at both preregistered large resolutions, plus the observed
+    throughput crossover at 320.  The size-256 throughput miss is carried into
+    ImageNet as a monitored end-to-end wall-clock risk instead of being hidden.
+    """
+
+    rows = decision_rows(document)
+    required_passes = (
+        ("paired_accuracy_delta_pp", 256),
+        ("paired_accuracy_delta_pp", 320),
+        ("train_peak_allocated_ratio", 256),
+        ("train_peak_allocated_ratio", 320),
+        ("train_throughput_ratio", 320),
+    )
+    if str(document["checkpoint_parity"]["gate_status"]) != "PASS":
+        return "HOLD"
+    if any(key not in rows or str(rows[key]["status"]) != "PASS" for key in required_passes):
+        return "HOLD"
+    return "GO"
 
 
 def release_explanation(document: Mapping[str, Any]) -> str:
     decision = str(document["decision"]["status"])
     parity = str(document["checkpoint_parity"]["gate_status"])
     release = str(document["release_readiness"]["final_release_status"])
-    if release == "READY":
+    scaleup = imagenet_scaleup_recommendation(document)
+    passed, total = gate_score(document)
+    condition_passed, condition_total = condition_score(document)
+    rows = decision_rows(document)
+    if scaleup == "GO" and release == "READY":
         return (
             "45 项 epoch-199 EMA 精度、8 卡独立效率复现和 30 个 checkpoint generic/fast 后验均已闭环；"
-            "λ4 满足预注册性能门槛，可进入正式交付。"
+            f"λ4 的逐尺度子检查为 {passed}/{total}，顶层条件为 {condition_passed}/{condition_total}。"
+            "现有证据支持进入与 DeiT 同协议的 "
+            "ImageNet-1K 300e 预训练实验（GO），但不预先声称 ImageNet 结果。"
+        )
+    if scaleup == "GO":
+        accuracy_256 = finite(rows[("paired_accuracy_delta_pp", 256)]["value"], "accuracy r256")
+        accuracy_320 = finite(rows[("paired_accuracy_delta_pp", 320)]["value"], "accuracy r320")
+        throughput_256 = finite(rows[("train_throughput_ratio", 256)]["value"], "throughput r256")
+        throughput_320 = finite(rows[("train_throughput_ratio", 320)]["value"], "throughput r320")
+        memory_256 = finite(rows[("train_peak_allocated_ratio", 256)]["value"], "memory r256")
+        memory_320 = finite(rows[("train_peak_allocated_ratio", 320)]["value"], "memory r320")
+        return (
+            f"λ4 在 {total} 个 CIFAR 预注册逐尺度子检查中通过 {passed} 个（顶层条件 "
+            f"{condition_passed}/{condition_total}，严格 overall FAIL）；唯一未达标子检查为 size 256 "
+            f"训练吞吐 {throughput_256:.4f}×。在 256/320 上精度分别提升 "
+            f"{accuracy_256:+.2f}/{accuracy_320:+.2f} pp，allocated 显存为 DeiT 的 "
+            f"{memory_256:.3f}/{memory_320:.3f}×，并在 320 达到 {throughput_320:.4f}× 吞吐。"
+            "结合 30/30 checkpoint parity，证据支持进入受控 ImageNet-1K 300e 预训练实验（GO）；"
+            "锁定的 CIFAR 严格门禁 FAIL 与全部数值原样保留。"
         )
     failed_parts = []
     if decision == "FAIL":
         failed_parts.append("λ4 预注册性能门槛未全部满足")
     if parity == "FAIL":
         failed_parts.append("至少一个 epoch-199 EMA checkpoint 的 generic/fast 精度后验失败")
-    return "；".join(failed_parts) + "。所有完整性能数值仍原样保留，本报告结论为 NO_GO，不做选择性删除。"
+    return (
+        "；".join(failed_parts)
+        + "。所有完整性能数值仍原样保留；当前证据不足以建议启动 ImageNet 规模实验（HOLD）。"
+    )
 
 
 def accuracy_table(document: Mapping[str, Any]) -> str:
@@ -928,7 +1000,34 @@ def render_html(bundle: EvidenceBundle) -> bytes:
     decision = str(document["decision"]["status"])
     parity = str(document["checkpoint_parity"]["gate_status"])
     release = str(document["release_readiness"]["final_release_status"])
+    scaleup = imagenet_scaleup_recommendation(document)
+    passed, total = gate_score(document)
+    condition_passed, condition_total = condition_score(document)
     generated_at = str(document["generated_at"])
+    if scaleup == "GO":
+        scaleup_note = (
+            "GO 表示现有 CIFAR 证据足以支持启动受控 ImageNet-1K 预训练验证，而非 ImageNet 精度或效率"
+            "已经得到证明。size 256 的吞吐差距继续作为端到端长训中的监控风险；锁定 aggregate 的 "
+            "FAIL/NO_GO 字段不被改写。"
+        )
+    else:
+        scaleup_note = (
+            "HOLD 表示在启动论文规模 ImageNet 训练前仍有阻塞证据需要解决。锁定 aggregate 的门禁字段和"
+            "全部性能数值均保持原样。"
+        )
+    if scaleup == "GO":
+        parity_boundary = (
+            "checkpoint parity 为交付实现的一致性提供证据；它不改写 size 256 吞吐项的 FAIL，后者作为 "
+            "ImageNet 长训中的已知监控风险保留，而不再作为否决 scale-up 的单一条件。"
+        )
+        imagenet_boundary = (
+            "本轮 CIFAR 结果不等同于 ImageNet 已验证，但已足以支持直接进入 ImageNet-1K 预训练评估；"
+            "下一阶段应使用同协议 DeiT baseline，检验收敛、Top-1、端到端吞吐/wall-clock 和显存。"
+        )
+    else:
+        parity_boundary = "checkpoint parity 或规模化趋势仍有阻塞项；在问题解决前不启动论文规模 ImageNet 长训。"
+        imagenet_boundary = "本轮 CIFAR 结果不构成 ImageNet 证据；当前下一阶段决策为 HOLD。"
+    footer_decision = "ImageNet validation recommended" if scaleup == "GO" else "ImageNet validation on hold"
     body = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -964,12 +1063,12 @@ def render_html(bundle: EvidenceBundle) -> bytes:
       <div class="card"><span>checkpoint 后验</span><b>30 / 30 · {e(parity)}</b><small>epoch-199 EMA · full CIFAR-100 test</small></div>
     </div>
   </header>
-  <nav><a href="#verdict">最终门禁</a><a href="#accuracy">精度</a><a href="#efficiency">效率</a><a href="#parity">Parity</a><a href="#boundary">边界与证据</a></nav>
+  <nav><a href="#verdict">ImageNet 推进结论</a><a href="#accuracy">精度</a><a href="#efficiency">效率</a><a href="#parity">Parity</a><a href="#boundary">边界与证据</a></nav>
 
   <section id="verdict">
-    <div class="eyebrow">Final release gate</div><h2>最终状态 <span class="badge {status_class(release)}">{e(release)}</span></h2>
-    <p>λ4 预注册性能判定：<span class="badge {status_class(decision)}">{e(decision)}</span>；checkpoint generic/fast 后验：<span class="badge {status_class(parity)}">{e(parity)}</span>。</p>
-    <p class="note">READY 仅表示这轮 CIFAR resize 预注册证据和实现后验全部通过；NO_GO 是完整实验的有效负面结论。两者都不能外推为 ImageNet 已验证。</p>
+    <div class="eyebrow">ImageNet scale-up decision</div><h2>ImageNet 规模实验 <span class="badge {status_class(scaleup)}">{e(scaleup)}</span></h2>
+    <p>下一阶段推进建议：<span class="badge {status_class(scaleup)}">{e(scaleup)}</span>；审计记录：λ4 CIFAR 预注册逐尺度子检查 <b>{passed}/{total}</b>，顶层条件 <b>{condition_passed}/{condition_total}</b>（严格 overall <span class="badge {status_class(decision)}">{e(decision)}</span>，归档 release 字段 <code>{e(release)}</code>）；checkpoint generic/fast 后验 <span class="badge {status_class(parity)}">{e(parity)}</span>。</p>
+    <p class="note">{e(scaleup_note)}</p>
     <div class="table-wrap"><table><thead><tr><th>metric</th><th>resize</th><th class="num">证据</th><th class="num">规则</th><th class="num">观测值</th><th>状态</th></tr></thead><tbody>{decision_table(document)}</tbody></table></div>
   </section>
 
@@ -1004,15 +1103,43 @@ def render_html(bundle: EvidenceBundle) -> bytes:
       <li>精度主指标是 epoch-199 EMA，不是跨 epoch 选择的 best。</li>
       <li>8 卡效率是锁定 batch 的 synthetic model-only microbenchmark；不替代 dataloader、增强、checkpoint I/O 在内的完整长训 wall-clock。</li>
       <li>Inference 被完整报告，但预注册 λ4 PASS 只由 256/320 的 paired accuracy、train throughput 和 train allocated memory 决定。</li>
-      <li>checkpoint parity 证明交付态 generic/fast 的精度兼容边界；它不把性能门槛的 FAIL 改写为 PASS。</li>
-      <li>本轮 CIFAR 结论用于决定 ImageNet scale-up 候选，不构成 ImageNet 精度、吞吐或收敛证据。</li>
+      <li>{e(parity_boundary)}</li>
+      <li>{e(imagenet_boundary)}</li>
     </ul>
     <p>机器可读原始证据：<a href="evidence/cifar_resize_20260810/aggregate_results.json">JSON</a> · <a href="evidence/cifar_resize_20260810/aggregate_results.csv">CSV</a> · <a href="evidence/cifar_resize_20260810/aggregate_results.md">Markdown</a> · <a href="evidence/cifar_resize_20260810/MANIFEST.json">hash manifest</a></p>
     <p class="muted">aggregate 生成时间：<code>{e(generated_at)}</code><br>JSON SHA-256：<code>{e(bundle.hashes['aggregate_results.json'])}</code></p>
   </section>
-  <footer>MergeNet CIFAR resize final report · 完全离线 HTML · evidence-derived, fail-closed</footer>
+  <footer>MergeNet CIFAR resize final report · 完全离线 HTML · evidence-derived · {e(footer_decision)}</footer>
 </main></body></html>\n"""
     return body.encode("utf-8")
+
+
+def render_visual_html(bundle: EvidenceBundle) -> tuple[bytes, str]:
+    """Render the chart-first report from the already validated evidence bundle."""
+
+    renderer_bytes = read_regular(VISUAL_RENDERER)
+    renderer_sha = sha256_bytes(renderer_bytes)
+    module_name = f"_mergenet_visual_report_renderer_{renderer_sha[:16]}"
+    spec = importlib.util.spec_from_file_location(module_name, VISUAL_RENDERER)
+    if spec is None or spec.loader is None:
+        fail("cannot load the visual report renderer")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        if read_regular(VISUAL_RENDERER) != renderer_bytes:
+            fail("visual report renderer changed while it was being loaded")
+        rendered = module.build_html(
+            bundle.document,
+            bundle.directory / "aggregate_results.json",
+            _evidence_validated=True,
+        )
+    except Exception as exc:
+        raise EvidenceError(
+            f"visual report renderer rejected the validated aggregate: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(rendered, str):
+        fail("visual report renderer returned non-text output")
+    return rendered.encode("utf-8"), renderer_sha
 
 
 def marker_update(
@@ -1063,6 +1190,9 @@ def lambda4_positioning(document: Mapping[str, Any]) -> str:
     decision = document["decision"]
     release = document["release_readiness"]["final_release_status"]
     parity = document["checkpoint_parity"]["gate_status"]
+    scaleup = imagenet_scaleup_recommendation(document)
+    passed, total = gate_score(document)
+    condition_passed, condition_total = condition_score(document)
     condition_rows = []
     for condition in decision["conditions"]:
         for row in condition["per_resize"]:
@@ -1071,9 +1201,18 @@ def lambda4_positioning(document: Mapping[str, Any]) -> str:
                 f"`{row['op']} {row['threshold']}` | {row['value']:.4f} | **{row['status']}** |"
             )
     explanation = release_explanation(document)
+    if scaleup == "GO":
+        positioning_principle = (
+            "size 256 的吞吐缺口作为 ImageNet 端到端 wall-clock 风险继续跟踪；320 的吞吐 crossover、"
+            "两尺度正精度增益与显存收益共同支持受控 scale-up。"
+        )
+    else:
+        positioning_principle = "当前证据组合存在阻塞项，解决前不启动论文规模 ImageNet scale-up。"
     return f"""## CIFAR resize 最终定位（aggregate：{document['generated_at']}）
 
-完整证据状态：accuracy `45/45`、efficiency `8/8`、checkpoint parity `30/30`。λ4 预注册性能判定为 **{decision['status']}**，checkpoint parity 为 **{parity}**，最终发布状态为 **{release}**。
+完整证据状态：accuracy `45/45`、efficiency `8/8`、checkpoint parity `30/30`。λ4 预注册逐尺度子检查为 **{passed}/{total}**，顶层条件为 **{condition_passed}/{condition_total}**，严格 overall 判定为 **{decision['status']}**；checkpoint parity 为 **{parity}**，归档 release 字段为 **{release}**。
+
+**下一阶段研究决策：ImageNet scale-up {scaleup}。** 这是一项基于完整趋势的实验推进建议，不会把锁定的 CIFAR 预注册判定改写为 PASS，也不预先宣称 ImageNet 结果。
 
 > {explanation}
 
@@ -1081,7 +1220,7 @@ def lambda4_positioning(document: Mapping[str, Any]) -> str:
 |---|---:|---:|---:|---:|---|
 {chr(10).join(condition_rows)}
 
-定位原则：λ4 只能按逐尺度实测结果描述。某一 resize 的吞吐 crossover 或显存收益不能外推成“全尺度更快”；完整负面 gate 也不能删除精度与显存收益。Inference 单列汇报，不进入当前预注册 λ4 性能 gate。详见[最终 HTML](../mergenet_cifar_resize_final_20260814.html)及[机器可读证据](cifar_resize_20260810/aggregate_results.json)。"""
+定位原则：λ4 只能按逐尺度实测结果描述。{positioning_principle}Inference 单列汇报，不进入当前预注册 λ4 性能 gate。详见[最终 HTML](../mergenet_cifar_resize_final_20260814.html)及[机器可读证据](cifar_resize_20260810/aggregate_results.json)。"""
 
 
 def build_outputs(bundle: EvidenceBundle, repo_root: Path) -> dict[Path, bytes]:
@@ -1105,54 +1244,98 @@ def build_outputs(bundle: EvidenceBundle, repo_root: Path) -> dict[Path, bytes]:
             raise EvidenceError(f"cannot read release document {relative}: {exc}") from exc
 
     document = bundle.document
+    visual_html, visual_renderer_sha = render_visual_html(bundle)
     release = document["release_readiness"]["final_release_status"]
     decision = document["decision"]["status"]
     parity = document["checkpoint_parity"]["gate_status"]
+    scaleup = imagenet_scaleup_recommendation(document)
+    passed, total = gate_score(document)
+    condition_passed, condition_total = condition_score(document)
+    if scaleup == "GO":
+        research_line = (
+            "建议用 λ4 与 matched DeiT-S/8 启动 300e 对照长训，并跟踪端到端 wall-clock；"
+            "这不等同于 ImageNet 已验证。"
+        )
+    else:
+        research_line = "当前存在阻塞证据，解决前不启动论文规模 ImageNet 长训。"
     root_body = f"""## CIFAR resize 最终结果
 
 - [最终 HTML 汇报](reports/mergenet_cifar_resize_final_20260814.html)：完整 5 resize × 3 model 精度、paired delta、8 卡效率和 30-checkpoint parity。
+- [图形化 HTML 看板](reports/mergenet_cifar_resize_visual_report_20260814.html)：基于同一锁定 aggregate 的 Top-1 趋势、paired delta 和训练吞吐–显存权衡图。
 - [最终证据包](reports/evidence/cifar_resize_20260810/)：aggregate JSON / CSV / Markdown 及 SHA-256 manifest。
-- 状态：accuracy `45/45`，efficiency `8/8`，checkpoint parity `30/30`（**{parity}**）；λ4 预注册判定 **{decision}**；最终发布 **{release}**。
+- 状态：accuracy `45/45`，efficiency `8/8`，checkpoint parity `30/30`（**{parity}**）；λ4 CIFAR 预注册逐尺度子检查 **{passed}/{total}**，顶层条件 **{condition_passed}/{condition_total}**（严格 overall **{decision}**，归档 release **{release}**）。
+- 研究结论：**ImageNet 规模预训练实验 {scaleup}**。{research_line}
 
-最终状态是对 CIFAR resize 预注册问题的完整回答，不代表 ImageNet 已训练或已验证。"""
+锁定的 CIFAR 门禁字段与完整数值保持不变；ImageNet `{scaleup}` 是独立的下一阶段实验建议。"""
     index_body = f"""## CIFAR resize 完整实验（最终 aggregate）
 
 - 完整性：accuracy `45/45`；efficiency `8/8`；checkpoint parity `30/30`，无 missing / invalid evidence。
-- λ4 预注册性能判定：**{decision}**。
+- λ4 预注册逐尺度子检查：**{passed}/{total}**；顶层条件：**{condition_passed}/{condition_total}**；严格 overall 判定 **{decision}**。
 - checkpoint generic / fast gate：**{parity}**。
-- 最终发布状态：**{release}**。
+- 归档 aggregate release 字段：**{release}**。
+- 下一阶段研究决策：**ImageNet scale-up {scaleup}**。
 - 人读汇报：[完整 HTML](../mergenet_cifar_resize_final_20260814.html)。
+- 图形看板：[可视化 HTML](../mergenet_cifar_resize_visual_report_20260814.html)。
 - 原始聚合：[JSON](cifar_resize_20260810/aggregate_results.json) · [CSV](cifar_resize_20260810/aggregate_results.csv) · [Markdown](cifar_resize_20260810/aggregate_results.md) · [SHA-256 manifest](cifar_resize_20260810/MANIFEST.json)。
 
-这里的性能结论限定为 8 卡独立、同卡配对的 synthetic model-only steady-state microbenchmark；主精度限定为 epoch-199 EMA。"""
+这里的性能证据限定为 8 卡独立、同卡配对的 synthetic model-only steady-state microbenchmark；主精度限定为 epoch-199 EMA。ImageNet `{scaleup}` 只建议启动受控验证，不声明 ImageNet Top-1 或效率结论。"""
     position_body = lambda4_positioning(document)
-    if decision == "PASS":
+    if scaleup == "GO" and decision == "PASS":
         performance_zh = (
             "λ4 的完整 CIFAR resize 预注册性能门禁为 **PASS**；"
-            "它因此仍是 performance-gate-qualified ImageNet scale-up 候选。"
+            "它是 performance-gate-qualified ImageNet scale-up 候选，建议进入论文规模预训练验证。"
         )
         handoff_bullet = (
-            "- `configs/mergenet_lambda4.yaml` is the performance-gate-qualified ImageNet scale-up candidate "
-            "from the completed CIFAR resize campaign. ImageNet accuracy and efficiency remain unmeasured."
+            "- `configs/mergenet_lambda4.yaml` is the recommended, performance-gate-qualified candidate for a "
+            "controlled ImageNet-1K paper-scale pretraining experiment. ImageNet accuracy and efficiency remain unmeasured."
         )
-        notes_position = "完整 CIFAR resize 预注册性能门禁通过，可作为 ImageNet scale-up 候选，但不代表 ImageNet 已验证。"
+        notes_position = "完整 CIFAR resize 预注册性能门禁通过，建议进入 ImageNet 论文规模预训练验证，但不代表 ImageNet 已验证。"
+        config_position = "# CIFAR primary performance gate passed; this is not an established ImageNet result."
+    elif scaleup == "GO":
+        performance_zh = (
+            f"λ4 的 CIFAR 预注册逐尺度子检查为 **{passed}/{total}**，顶层条件为 "
+            f"**{condition_passed}/{condition_total}**，严格 overall 门禁仍为 **FAIL**；"
+            "唯一缺口是 size 256 训练吞吐。两尺度正精度增益和显存收益、320 吞吐 crossover "
+            "共同支持把 `configs/mergenet_lambda4.yaml` 推进到受控 ImageNet-1K 论文规模实验。"
+        )
+        handoff_bullet = (
+            "- `configs/mergenet_lambda4.yaml` is the recommended candidate for a controlled ImageNet-1K "
+            f"paper-scale pretraining experiment. It passed {passed}/{total} preregistered resolution-level "
+            f"checks and {condition_passed}/{condition_total} top-level conditions; strict overall remains FAIL "
+            "because size-256 training throughput was the sole missed sub-check."
+        )
+        notes_position = (
+            f"CIFAR 预注册逐尺度子检查为 {passed}/{total}、顶层条件为 "
+            f"{condition_passed}/{condition_total}，唯一缺口为 size 256 训练吞吐；"
+            "综合精度、显存与 320 吞吐 crossover，建议进入受控 ImageNet 论文规模预训练验证。"
+        )
         config_position = (
-            "# CIFAR primary performance gate passed; lambda4 is the performance-gate-qualified scale-up candidate,\n"
-            "# not an established ImageNet result."
+            f"# CIFAR strict gate: {passed}/{total} resolution-level checks, "
+            f"{condition_passed}/{condition_total} top-level conditions (overall FAIL); sole miss: size-256 train throughput."
         )
+    elif decision == "PASS":
+        performance_zh = (
+            "λ4 的完整 CIFAR resize 预注册性能门禁为 **PASS**，但实现后验尚未支持 ImageNet 推进；"
+            "当前 scale-up 决策为 **HOLD**。"
+        )
+        handoff_bullet = (
+            "- `configs/mergenet_lambda4.yaml` passed the CIFAR performance gate, but the controlled ImageNet "
+            "experiment recommendation is HOLD until checkpoint parity is resolved."
+        )
+        notes_position = "CIFAR 性能门禁通过，但 checkpoint parity 阻塞 scale-up，当前为 HOLD。"
+        config_position = "# Scale-up is blocked pending checkpoint parity."
     else:
         performance_zh = (
-            "λ4 的完整 CIFAR resize 预注册性能门禁为 **FAIL**；"
-            "`configs/mergenet_lambda4.yaml` 只能定位为可直接运行的 exploratory ImageNet 配置，"
-            "不能称为 CIFAR 效率赢家或无条件推荐方案。"
+            f"λ4 的 CIFAR 预注册逐尺度子检查为 **{passed}/{total}**，顶层条件为 "
+            f"**{condition_passed}/{condition_total}**，严格 overall 门禁为 **FAIL**；"
+            "当前证据组合不足以建议 ImageNet scale-up，决策为 **HOLD**。"
         )
         handoff_bullet = (
-            "- `configs/mergenet_lambda4.yaml` is a runnable exploratory ImageNet scale-up configuration. "
-            "The completed CIFAR primary performance gate is FAIL, so it is not an unconditional recommendation "
-            "or a CIFAR efficiency winner."
+            "- `configs/mergenet_lambda4.yaml` remains runnable, but the controlled ImageNet experiment "
+            "recommendation is HOLD under the current evidence."
         )
-        notes_position = "这是可直接运行的 exploratory 候选；完整 CIFAR resize 跨尺度性能门禁未通过，不能称为效率赢家或无条件推荐配置。"
-        config_position = "# Runnable exploratory ImageNet candidate; the cross-scale primary performance gate was not passed."
+        notes_position = "当前证据组合不足以建议 ImageNet scale-up，决策为 HOLD。"
+        config_position = "# Scale-up is blocked under the current evidence."
 
     if parity == "PASS":
         parity_zh = "30/30 checkpoint generic/fast 后验为 **PASS**。"
@@ -1172,14 +1355,15 @@ def build_outputs(bundle: EvidenceBundle, repo_root: Path) -> dict[Path, bytes]:
         config_parity = "# Final release NO_GO: epoch-199 generic/fast checkpoint parity failed."
 
     handoff_summary = (
-        f"最终状态组合：primary performance **{decision}**，checkpoint parity **{parity}**，release **{release}**。"
+        f"证据状态：primary performance **{decision}**，checkpoint parity **{parity}**，"
+        f"归档 release **{release}**；独立的 ImageNet 实验推进建议为 **{scaleup}**。"
         f"{performance_zh}{parity_zh}"
-        "ImageNet 精度、吞吐和收敛尚未测量；若继续 scale-up，DeiT baseline 必须按同协议并行长训。"
+        "ImageNet 精度、吞吐和收敛尚未测量；执行 scale-up 时，DeiT baseline 必须按同协议并行长训。"
     )
     handoff_bullet = handoff_bullet + " " + parity_en
     config_comment = (
         f"# CIFAR primary performance gate: {decision}; checkpoint parity: {parity}; release: {release}.\n"
-        f"{config_position}\n{config_parity}"
+        f"# ImageNet scale-up recommendation: {scaleup}.\n{config_position}\n{config_parity}"
     )
     handoff_paragraph = (
         handoff_summary
@@ -1200,10 +1384,16 @@ def build_outputs(bundle: EvidenceBundle, repo_root: Path) -> dict[Path, bytes]:
         "checkpoint_parity": f"30/30:{parity}",
         "lambda4_decision": decision,
         "final_release_status": release,
+        "imagenet_scaleup_recommendation": scaleup,
         "files": {name: {"sha256": digest, "bytes": len(getattr(bundle, {"aggregate_results.json": "json_bytes", "aggregate_results.csv": "csv_bytes", "aggregate_results.md": "markdown_bytes"}[name]))} for name, digest in sorted(bundle.hashes.items())},
         "builder": {
             "path": "experiments/cifar_resize_20260810/build_final_report.py",
             "sha256": sha256_bytes(Path(__file__).read_bytes()),
+        },
+        "visual_renderer": {
+            "path": "experiments/cifar_resize_20260810/build_visual_report.py",
+            "sha256": visual_renderer_sha,
+            "policy": "rendered atomically from the same validated aggregate bundle",
         },
         "canonical_projection_renderer": {
             "path": "experiments/cifar_resize_20260810/aggregate_results.py",
@@ -1213,6 +1403,7 @@ def build_outputs(bundle: EvidenceBundle, repo_root: Path) -> dict[Path, bytes]:
     }
     return {
         FINAL_HTML: render_html(bundle),
+        VISUAL_HTML: visual_html,
         EVIDENCE_DIR / "aggregate_results.json": bundle.json_bytes,
         EVIDENCE_DIR / "aggregate_results.csv": bundle.csv_bytes,
         EVIDENCE_DIR / "aggregate_results.md": bundle.markdown_bytes,
@@ -1386,6 +1577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "checkpoint_parity": f"30/30:{bundle.document['checkpoint_parity']['gate_status']}",
                 "lambda4_decision": bundle.document["decision"]["status"],
                 "final_release_status": bundle.document["release_readiness"]["final_release_status"],
+                "imagenet_scaleup_recommendation": imagenet_scaleup_recommendation(bundle.document),
                 "aggregate_hashes": dict(bundle.hashes),
                 "canonical_projection_renderer_sha256": PINNED_AGGREGATE_RENDERER_SHA256,
                 "outputs": sorted(str(path) for path in outputs),

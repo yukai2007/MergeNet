@@ -1,6 +1,7 @@
 # CIFAR_RESIZE_FINAL_LAMBDA4_CONFIG:START
 # CIFAR primary performance gate: FAIL; checkpoint parity: PASS; release: NO_GO.
-# Runnable exploratory ImageNet candidate; the cross-scale primary performance gate was not passed.
+# ImageNet scale-up recommendation: GO.
+# CIFAR strict gate: 5/6 resolution-level checks, 2/3 top-level conditions (overall FAIL); sole miss: size-256 train throughput.
 # Epoch-199 generic/fast checkpoint parity passed 30/30.
 # CIFAR_RESIZE_FINAL_LAMBDA4_CONFIG:END
 # Paths, run name, batch size, accumulation, and resume are launcher-owned.

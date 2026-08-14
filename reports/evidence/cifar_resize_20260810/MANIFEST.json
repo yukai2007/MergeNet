@@ -3,7 +3,7 @@
   "aggregate_generated_at": "2026-08-14T07:19:47+00:00",
   "builder": {
     "path": "experiments/cifar_resize_20260810/build_final_report.py",
-    "sha256": "73daa888eadd280d5f3afe73a982a5db2fa2bd06efd2edb351cef6448e49882c"
+    "sha256": "bfe36b31461fc26dc163cfabc022d63a44015d63865ee4fd5a04899e6279f538"
   },
   "canonical_projection_renderer": {
     "path": "experiments/cifar_resize_20260810/aggregate_results.py",
@@ -27,6 +27,12 @@
     }
   },
   "final_release_status": "NO_GO",
+  "imagenet_scaleup_recommendation": "GO",
   "lambda4_decision": "FAIL",
-  "schema_version": "mergenet.cifar_resize_report_evidence.v1"
+  "schema_version": "mergenet.cifar_resize_report_evidence.v1",
+  "visual_renderer": {
+    "path": "experiments/cifar_resize_20260810/build_visual_report.py",
+    "policy": "rendered atomically from the same validated aggregate bundle",
+    "sha256": "faae6c9a801fef04409b1b786ff0b0d0af45514fc26fc5bc63e3907f4b67d6b7"
+  }
 }

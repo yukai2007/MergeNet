@@ -190,6 +190,15 @@ def make_document(ready: bool = False, parity_failure: bool = False) -> dict[str
                         "resize": resize,
                         "mode": mode,
                         "physical_gpus": list(builder.GPUS),
+                        "per_gpu": [
+                            {
+                                "physical_gpu": gpu,
+                                "throughput_ratio": values[gpu],
+                                "peak_allocated_ratio": allocated_target
+                                + (gpu - 3.5) / 1000,
+                            }
+                            for gpu in builder.GPUS
+                        ],
                         "throughput_ratio": stats(values),
                         "step_time_ratio": stats([1 / value for value in values]),
                         "peak_allocated_ratio": stats([allocated_target + (gpu - 3.5) / 1000 for gpu in builder.GPUS]),
@@ -266,6 +275,10 @@ def make_document(ready: bool = False, parity_failure: bool = False) -> dict[str
         "generated_at": "2026-08-14T12:00:00+00:00",
         "protocol": "/campaign/runtime/protocol.json",
         "campaign_root": "/campaign",
+        "campaign_state": {
+            "phase": "complete",
+            "updated_at": "2026-08-14T11:00:00+00:00",
+        },
         "matrix": {
             "models": list(builder.MODELS),
             "resizes": list(builder.RESIZES),
@@ -523,6 +536,7 @@ class FinalReportBuilderTest(unittest.TestCase):
             self.assertEqual((code, stderr), (0, ""))
             payload = json.loads(stdout)
             self.assertEqual(payload["final_release_status"], "READY")
+            self.assertEqual(payload["imagenet_scaleup_recommendation"], "GO")
             self.assertFalse(payload["published"])
             after = {path.relative_to(repo): path.read_bytes() for path in repo.rglob("*") if path.is_file()}
             self.assertEqual(before, after)
@@ -536,19 +550,31 @@ class FinalReportBuilderTest(unittest.TestCase):
             source = write_bundle(aggregate, make_document(ready=False))
             code, stdout, stderr = self.run_main(["--aggregate-dir", str(aggregate), "--repo-root", str(repo)])
             self.assertEqual((code, stderr), (0, ""))
-            self.assertEqual(json.loads(stdout)["final_release_status"], "NO_GO")
+            payload = json.loads(stdout)
+            self.assertEqual(payload["final_release_status"], "NO_GO")
+            self.assertEqual(payload["imagenet_scaleup_recommendation"], "GO")
             report = (repo / builder.FINAL_HTML).read_text(encoding="utf-8")
-            self.assertIn("最终状态 <span class=\"badge fail\">NO_GO", report)
+            self.assertIn("ImageNet 规模实验 <span class=\"badge pass\">GO", report)
+            self.assertIn("严格 overall <span class=\"badge fail\">FAIL", report)
+            self.assertIn("归档 release 字段 <code>NO_GO</code>", report)
             self.assertEqual(report.count("data-accuracy-row="), 15)
             self.assertEqual(report.count("data-paired-accuracy-row="), 10)
             self.assertEqual(report.count("data-efficiency-raw-row="), 40)
             self.assertEqual(report.count("data-efficiency-paired-row="), 30)
             self.assertEqual(report.count("data-synthetic-parity-row="), 10)
             self.assertEqual(report.count("data-checkpoint-parity-row="), 30)
+            visual_report = (repo / builder.VISUAL_HTML).read_text(encoding="utf-8")
+            self.assertIn("ImageNet 推进建议</span><strong><span class=\"status pass\">GO", visual_report)
+            self.assertEqual(visual_report.count("data-absolute-inference-row="), 25)
             for name, value in source.items():
                 self.assertEqual((repo / builder.EVIDENCE_DIR / name).read_bytes(), value)
             manifest = json.loads((repo / builder.EVIDENCE_DIR / "MANIFEST.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["final_release_status"], "NO_GO")
+            self.assertEqual(manifest["imagenet_scaleup_recommendation"], "GO")
+            self.assertEqual(
+                manifest["visual_renderer"]["sha256"],
+                hashlib.sha256(builder.VISUAL_RENDERER.read_bytes()).hexdigest(),
+            )
             for name, value in source.items():
                 self.assertEqual(manifest["files"][name]["sha256"], hashlib.sha256(value).hexdigest())
             for relative in (builder.ROOT_README, builder.INDEX_DOC, builder.POSITION_DOC):
@@ -561,13 +587,11 @@ class FinalReportBuilderTest(unittest.TestCase):
             handoff_readme = (repo / builder.HANDOFF_README).read_text(encoding="utf-8")
             handoff_notes = (repo / builder.HANDOFF_NOTES).read_text(encoding="utf-8")
             config = (repo / builder.LAMBDA4_CONFIG).read_text(encoding="utf-8")
-            self.assertNotIn("recommended long-run candidate", handoff_readme)
-            self.assertNotIn("recommended scale-up candidate", handoff_readme)
-            self.assertNotIn("效率优先候选", handoff_notes)
             self.assertNotIn("efficiency winner", config)
-            self.assertIn("runnable exploratory", handoff_readme)
-            self.assertIn("exploratory 候选", handoff_notes)
-            self.assertIn("Runnable exploratory ImageNet candidate", config)
+            self.assertIn("recommended candidate for a controlled ImageNet-1K", handoff_readme)
+            self.assertIn("建议进入受控 ImageNet 论文规模预训练验证", handoff_notes)
+            self.assertIn("ImageNet scale-up recommendation: GO", config)
+            self.assertIn("sole miss: size-256 train throughput", config)
             self.assertEqual(config.count("model: mergenet_small_cls"), 1)
             self.assertEqual(config.count("lambda_local: 4.0"), 1)
             before = {path.relative_to(repo): hashlib.sha256(path.read_bytes()).hexdigest() for path in repo.rglob("*") if path.is_file()}
@@ -586,6 +610,7 @@ class FinalReportBuilderTest(unittest.TestCase):
             before = tree_snapshot(repo)
             self.assertFalse((repo / builder.EVIDENCE_DIR).exists())
             self.assertFalse((repo / builder.FINAL_HTML).exists())
+            self.assertFalse((repo / builder.VISUAL_HTML).exists())
 
             real_replace = builder.os.replace
             calls = 0
@@ -610,6 +635,7 @@ class FinalReportBuilderTest(unittest.TestCase):
             self.assertEqual(tree_snapshot(repo), before)
             self.assertFalse((repo / builder.EVIDENCE_DIR).exists())
             self.assertFalse((repo / builder.FINAL_HTML).exists())
+            self.assertFalse((repo / builder.VISUAL_HTML).exists())
             self.assertFalse(any(path.name.startswith(".cifar-final-") for path in repo.iterdir()))
 
     def test_parity_failure_is_publishable_no_go_not_incomplete(self) -> None:
@@ -625,6 +651,7 @@ class FinalReportBuilderTest(unittest.TestCase):
             payload = json.loads(stdout)
             self.assertEqual(payload["checkpoint_parity"], "30/30:FAIL")
             self.assertEqual(payload["final_release_status"], "NO_GO")
+            self.assertEqual(payload["imagenet_scaleup_recommendation"], "HOLD")
 
     def test_ready_handoff_wording_is_gate_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -638,7 +665,7 @@ class FinalReportBuilderTest(unittest.TestCase):
             readme = (repo / builder.HANDOFF_README).read_text(encoding="utf-8")
             notes = (repo / builder.HANDOFF_NOTES).read_text(encoding="utf-8")
             config = (repo / builder.LAMBDA4_CONFIG).read_text(encoding="utf-8")
-            self.assertIn("gate-qualified ImageNet scale-up candidate", readme)
+            self.assertIn("performance-gate-qualified ImageNet scale-up", readme)
             self.assertIn("ImageNet accuracy and efficiency remain unmeasured", readme)
             self.assertIn("不代表 ImageNet 已验证", notes)
             self.assertIn("not an established ImageNet result", config)
@@ -646,12 +673,12 @@ class FinalReportBuilderTest(unittest.TestCase):
 
     def test_all_performance_parity_status_combinations_have_accurate_handoff_copy(self) -> None:
         cases = (
-            (True, False, "PASS", "PASS", "READY"),
-            (False, False, "FAIL", "PASS", "NO_GO"),
-            (True, True, "PASS", "FAIL", "NO_GO"),
-            (False, True, "FAIL", "FAIL", "NO_GO"),
+            (True, False, "PASS", "PASS", "READY", "GO"),
+            (False, False, "FAIL", "PASS", "NO_GO", "GO"),
+            (True, True, "PASS", "FAIL", "NO_GO", "HOLD"),
+            (False, True, "FAIL", "FAIL", "NO_GO", "HOLD"),
         )
-        for performance_pass, parity_failure, decision, parity, release in cases:
+        for performance_pass, parity_failure, decision, parity, release, scaleup in cases:
             with self.subTest(decision=decision, parity=parity), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 repo = root / "repo"
@@ -672,19 +699,23 @@ class FinalReportBuilderTest(unittest.TestCase):
                     f"primary performance gate: {decision}; checkpoint parity: {parity}; release: {release}",
                     config,
                 )
+                self.assertIn(f"ImageNet scale-up recommendation: {scaleup}", config)
                 self.assertNotIn("currently running", root_readme)
                 if performance_pass:
-                    self.assertIn("performance-gate-qualified", combined)
+                    if not parity_failure:
+                        self.assertIn("performance-gate-qualified", combined)
                     self.assertNotIn("cross-scale primary performance gate was not passed", combined)
                     self.assertNotIn("跨尺度性能门禁未通过", combined)
                 else:
-                    self.assertIn("cross-scale primary performance gate was not passed", combined)
-                    self.assertIn("跨尺度性能门禁未通过", combined)
                     self.assertNotIn("lambda4 is the performance-gate-qualified", config)
+                    if not parity_failure:
+                        self.assertIn("recommended candidate for a controlled ImageNet-1K", readme)
+                        self.assertIn("唯一缺口为 size 256 训练吞吐", notes)
                 if parity_failure:
                     self.assertIn("checkpoint parity failed", combined)
                     self.assertIn("后验失败", combined)
                     self.assertIn("final release is no_go", combined.lower())
+                    self.assertIn("recommendation is HOLD", readme)
                 else:
                     self.assertIn("parity passed 30/30", combined)
                     self.assertNotIn("checkpoint parity failed", combined)

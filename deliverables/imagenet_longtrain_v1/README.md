@@ -1,17 +1,17 @@
 # MergeNet ImageNet-1K 300-epoch handoff
 
-This directory is a self-contained training handoff for single-node, multi-GPU ImageNet-1K runs. It contains source code, pinned CV dependencies, three auditable YAML protocols, a guarded `torchrun` launcher, and preflight tests. It intentionally contains no dataset, checkpoint, training log, or prior experiment output.
+This directory is a self-contained training handoff for single-node, multi-GPU ImageNet-1K runs. It contains source code, pinned CV dependencies, three auditable YAML protocols, a canonical paper-scale pretraining entrypoint, a guarded `torchrun` launcher, and preflight tests. It intentionally contains no dataset, checkpoint, training log, or prior experiment output.
 
 ## Readiness and scope
 
 <!-- CIFAR_RESIZE_FINAL_HANDOFF_BULLET:START -->
-- `configs/mergenet_lambda4.yaml` is a runnable exploratory ImageNet scale-up configuration. The completed CIFAR primary performance gate is FAIL, so it is not an unconditional recommendation or a CIFAR efficiency winner. Checkpoint generic/fast parity passed 30/30.
+- `configs/mergenet_lambda4.yaml` is the recommended candidate for a controlled ImageNet-1K paper-scale pretraining experiment. It passed 5/6 preregistered resolution-level checks and 2/3 top-level conditions; strict overall remains FAIL because size-256 training throughput was the sole missed sub-check. Checkpoint generic/fast parity passed 30/30.
 <!-- CIFAR_RESIZE_FINAL_HANDOFF_BULLET:END -->
 - `configs/mergenet_lambda2.yaml` is the conservative fallback: p8, 6 local + 6 latent blocks, lambda=2, and local window 16. It retains more tokens and therefore costs more memory/compute.
 - `configs/deit_small_p8_baseline.yaml` is the matched DeiT-S/8 baseline.
 
 <!-- CIFAR_RESIZE_FINAL_HANDOFF_SCOPE:START -->
-最终状态组合：primary performance **FAIL**，checkpoint parity **PASS**，release **NO_GO**。λ4 的完整 CIFAR resize 预注册性能门禁为 **FAIL**；`configs/mergenet_lambda4.yaml` 只能定位为可直接运行的 exploratory ImageNet 配置，不能称为 CIFAR 效率赢家或无条件推荐方案。30/30 checkpoint generic/fast 后验为 **PASS**。ImageNet 精度、吞吐和收敛尚未测量；若继续 scale-up，DeiT baseline 必须按同协议并行长训。 Final CIFAR evidence: [HTML report](../../reports/mergenet_cifar_resize_final_20260814.html) and [aggregate JSON](../../reports/evidence/cifar_resize_20260810/aggregate_results.json).
+证据状态：primary performance **FAIL**，checkpoint parity **PASS**，归档 release **NO_GO**；独立的 ImageNet 实验推进建议为 **GO**。λ4 的 CIFAR 预注册逐尺度子检查为 **5/6**，顶层条件为 **2/3**，严格 overall 门禁仍为 **FAIL**；唯一缺口是 size 256 训练吞吐。两尺度正精度增益和显存收益、320 吞吐 crossover 共同支持把 `configs/mergenet_lambda4.yaml` 推进到受控 ImageNet-1K 论文规模实验。30/30 checkpoint generic/fast 后验为 **PASS**。ImageNet 精度、吞吐和收敛尚未测量；执行 scale-up 时，DeiT baseline 必须按同协议并行长训。 Final CIFAR evidence: [HTML report](../../reports/mergenet_cifar_resize_final_20260814.html) and [aggregate JSON](../../reports/evidence/cifar_resize_20260810/aggregate_results.json).
 <!-- CIFAR_RESIZE_FINAL_HANDOFF_SCOPE:END -->
 
 ## 1. Environment
@@ -58,19 +58,21 @@ The standalone preflight validates `GPUS` and maps it to
 `CUDA_VISIBLE_DEVICES`, exactly like the launcher; duplicate, malformed, or
 zero-padded GPU IDs are rejected before any CUDA import.
 
-## 4. Launch
+## 4. Paper-scale pretraining launch
 
 The safe default targets an effective global batch of 1,024 and keeps the micro-batch at or below 64 by selecting gradient accumulation automatically. For 8 GPUs this resolves to batch 64/GPU and `update_freq=2`; for 4 GPUs it resolves to batch 64/GPU and `update_freq=4`.
+
+The canonical paper-scale entrypoint fixes the λ4 ImageNet-1K / p8 / 300-epoch protocol and delegates runtime, preflight, resume, and output safety to the audited launcher:
 
 ```bash
 DATA_DIR=/path/to/imagenet \
 OUTPUT_DIR=/path/to/output \
 GPUS=0,1,2,3,4,5,6,7 \
 RUN_NAME=in1k300_mergenet_lambda4_seed42 \
-bash scripts/train_imagenet_300e.sh configs/mergenet_lambda4.yaml
+bash scripts/pretrain_imagenet_300e.sh
 ```
 
-Matched baseline:
+The matched DeiT baseline uses the same audited launcher and optimization protocol:
 
 ```bash
 DATA_DIR=/path/to/imagenet \
@@ -85,6 +87,7 @@ Useful launcher variables:
 | Variable | Default | Meaning |
 |---|---:|---|
 | `GPUS` | all visible GPUs | Comma-separated physical GPU IDs; sets `CUDA_VISIBLE_DEVICES`. |
+| `RUN_NAME` | `in1k300_<variant>_seed42` | Single output-directory name; must begin with a letter/digit and cannot contain path separators. |
 | `NPROC_PER_NODE` | inferred | Number of local `torchrun` workers. |
 | `GLOBAL_BATCH` | `1024` | Effective batch across all workers and accumulation steps. |
 | `MAX_MICRO_BATCH` | `64` | Largest automatically selected per-GPU batch. |

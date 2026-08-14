@@ -5,6 +5,7 @@ set -Eeuo pipefail
 TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT_DIR=$(cd "${TEST_DIR}/.." && pwd)
 LAUNCHER="${ROOT_DIR}/scripts/train_imagenet_300e.sh"
+PRETRAIN_LAUNCHER="${ROOT_DIR}/scripts/pretrain_imagenet_300e.sh"
 PREFLIGHT="${ROOT_DIR}/scripts/preflight_imagenet.sh"
 GPU_VISIBILITY_HELPER="${ROOT_DIR}/scripts/gpu_visibility.sh"
 CONFIG="${ROOT_DIR}/configs/mergenet_lambda4.yaml"
@@ -50,6 +51,57 @@ invoke_launcher_with_state() {
 invoke_launcher() {
   invoke_launcher_with_state launcher_guard_test none 0 "$@"
 }
+
+expect_run_name_rejected() {
+  local run_name="$1"
+  local output
+  if output=$(invoke_launcher_with_state "${run_name}" none 0 2>&1); then
+    fail "unsafe RUN_NAME was accepted: ${run_name}"
+  fi
+  grep -q 'RUN_NAME must start with a letter or digit' <<< "${output}" \
+    || fail "unsafe RUN_NAME failed for the wrong reason (${run_name}): ${output}"
+}
+
+expect_run_name_rejected '.'
+expect_run_name_rejected '..'
+expect_run_name_rejected '-outside'
+
+invoke_pretrain_launcher() {
+  DATA_DIR="${TEST_TMP}/fake-imagenet" \
+  OUTPUT_DIR="${TEST_TMP}/outputs" \
+  RUN_NAME=paper_pretrain_guard_test \
+  GPUS= \
+  NPROC_PER_NODE=2 \
+  GLOBAL_BATCH=1024 \
+  MAX_MICRO_BATCH=64 \
+  BATCH_SIZE= \
+  UPDATE_FREQ= \
+  VAL_BATCH_SIZE= \
+  RUN_PREFLIGHT=0 \
+  DRY_RUN=1 \
+  RESUME=none \
+  ALLOW_EXISTING_RUN_DIR=0 \
+  PYTHON_BIN=true \
+  TORCHRUN_BIN=true \
+    bash "${PRETRAIN_LAUNCHER}" "$@"
+}
+
+pretrain_output=$(invoke_pretrain_launcher --lr 2.5e-4 --prefetcher 2>&1) \
+  || fail 'canonical paper-scale pretraining wrapper failed its dry run'
+grep -Fq "[launcher] config=${CONFIG}" <<< "${pretrain_output}" \
+  || fail 'pretraining wrapper did not select the canonical lambda4 protocol'
+grep -Fq 'workers=2, batch/GPU=64, update_freq=8, effective_global_batch=1024' \
+  <<< "${pretrain_output}" \
+  || fail 'pretraining wrapper did not preserve the paper-scale global-batch protocol'
+grep -q -- '--lr 2.5e-4 --prefetcher' <<< "${pretrain_output}" \
+  || fail 'pretraining wrapper did not forward documented launcher overrides'
+
+pretrain_override_output=''
+if pretrain_override_output=$(invoke_pretrain_launcher --epochs 1 2>&1); then
+  fail 'pretraining wrapper accepted an epoch override'
+fi
+grep -q 'only --lr and --prefetcher may override' <<< "${pretrain_override_output}" \
+  || fail "pretraining wrapper epoch override failed for the wrong reason: ${pretrain_override_output}"
 
 allowed_output=$(invoke_launcher --lr 2.5e-4 --prefetcher 2>&1) \
   || fail 'documented --lr/--prefetcher override was rejected'

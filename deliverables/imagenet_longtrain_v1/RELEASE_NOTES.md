@@ -2,6 +2,8 @@
 
 发布日期：2026-08-09
 
+本次报告与论文规模入口更新：2026-08-14
+
 状态：可交付的 ImageNet-1K 长训候选；ImageNet 最终精度待本次大规模训练验证。
 
 ## 本版解决的问题
@@ -22,6 +24,7 @@
 - 修正 conda-forge 可解析的 Ninja 锁定版本为 `1.11.1`。
 - `ALLOW_EXISTING_RUN_DIR=1` 现在只允许顶层普通 `launcher_*.log`；scratch
   或 auto-without-last 遇到任意 checkpoint/model artifact 都会无条件失败。
+- `RUN_NAME` 现在必须以字母或数字开头，显式拒绝 `.`、`..` 和前导连字符，防止运行目录逃逸出 `${OUTPUT_DIR}` 下的单层实验目录。
 - 删除未交付的 p16 pooling 消融、自定义 DeiT wrapper 及模型文件内 dummy
   forward；对缺少随包实现的 MergeNet/ToMe `--pretrained` 与差分
   `--lr_local` 显式 fail-closed。正式三份 YAML 均不触发这些门禁；原生 timm
@@ -36,8 +39,9 @@
 ## 交付训练协议
 
 - 共同设置：ImageNet-1K、224×224、patch size 8、300 epochs、AdamW、global batch 1024、lr `5e-4`、5-epoch warmup、cosine、AMP、EMA、DeiT augmentation。
+- 论文规模主入口：`scripts/pretrain_imagenet_300e.sh` 固定 λ4 canonical 300e 配置，并委托受审计的单机多卡 launcher 完成 preflight、有效 batch、resume、日志和 checkpoint 管理。
 <!-- CIFAR_RESIZE_FINAL_HANDOFF_NOTES:START -->
-- 主训练：`configs/mergenet_lambda4.yaml`，4 local + 8 latent、lambda=4、window 32；这是可直接运行的 exploratory 候选；完整 CIFAR resize 跨尺度性能门禁未通过，不能称为效率赢家或无条件推荐配置。checkpoint generic/fast 后验 30/30 通过。
+- 主训练：`configs/mergenet_lambda4.yaml`，4 local + 8 latent、lambda=4、window 32；CIFAR 预注册逐尺度子检查为 5/6、顶层条件为 2/3，唯一缺口为 size 256 训练吞吐；综合精度、显存与 320 吞吐 crossover，建议进入受控 ImageNet 论文规模预训练验证。checkpoint generic/fast 后验 30/30 通过。
 <!-- CIFAR_RESIZE_FINAL_HANDOFF_NOTES:END -->
 - 对照训练：`configs/deit_small_p8_baseline.yaml`，DeiT-S/8，同一优化与增强协议。
 - 回退训练：`configs/mergenet_lambda2.yaml`，6+6、lambda=2、window 16；保留更多 token，准确率风险更保守但成本更高。
@@ -91,7 +95,7 @@ DATA_DIR=/path/to/imagenet \
 OUTPUT_DIR=/path/to/output \
 GPUS=0,1,2,3,4,5,6,7 \
 RUN_NAME=in1k300_mergenet_lambda4_seed42 \
-bash scripts/train_imagenet_300e.sh configs/mergenet_lambda4.yaml
+bash scripts/pretrain_imagenet_300e.sh
 ```
 
 开始无人值守长训前，至少观察首个 optimizer update、首轮 validation、checkpoint 写入，并做一次 `RESUME=auto` 重启演练。完整操作与回退说明见 `README.md`。
