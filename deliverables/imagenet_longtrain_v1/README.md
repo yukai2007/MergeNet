@@ -4,11 +4,15 @@ This directory is a self-contained training handoff for single-node, multi-GPU I
 
 ## Readiness and scope
 
-- `configs/mergenet_lambda4.yaml` is the recommended long-run candidate: p8, 4 local + 8 latent blocks, lambda=4, local window 32, and the deterministic fast evaluation grouping.
+<!-- CIFAR_RESIZE_FINAL_HANDOFF_BULLET:START -->
+- `configs/mergenet_lambda4.yaml` is a runnable exploratory ImageNet scale-up configuration. The completed CIFAR primary performance gate is FAIL, so it is not an unconditional recommendation or a CIFAR efficiency winner. Checkpoint generic/fast parity passed 30/30.
+<!-- CIFAR_RESIZE_FINAL_HANDOFF_BULLET:END -->
 - `configs/mergenet_lambda2.yaml` is the conservative fallback: p8, 6 local + 6 latent blocks, lambda=2, and local window 16. It retains more tokens and therefore costs more memory/compute.
 - `configs/deit_small_p8_baseline.yaml` is the matched DeiT-S/8 baseline.
 
-The architecture and efficiency choices above come from the completed CIFAR-100 campaign. **ImageNet-1K accuracy has not yet been measured.** Treat lambda=4 as the recommended scale-up candidate, not as a claimed ImageNet result. Run the baseline and lambda=4 under the same protocol; use lambda=2 if the lambda=4 accuracy curve is clearly under the baseline early in training.
+<!-- CIFAR_RESIZE_FINAL_HANDOFF_SCOPE:START -->
+最终状态组合：primary performance **FAIL**，checkpoint parity **PASS**，release **NO_GO**。λ4 的完整 CIFAR resize 预注册性能门禁为 **FAIL**；`configs/mergenet_lambda4.yaml` 只能定位为可直接运行的 exploratory ImageNet 配置，不能称为 CIFAR 效率赢家或无条件推荐方案。30/30 checkpoint generic/fast 后验为 **PASS**。ImageNet 精度、吞吐和收敛尚未测量；若继续 scale-up，DeiT baseline 必须按同协议并行长训。 Final CIFAR evidence: [HTML report](../../reports/mergenet_cifar_resize_final_20260814.html) and [aggregate JSON](../../reports/evidence/cifar_resize_20260810/aggregate_results.json).
+<!-- CIFAR_RESIZE_FINAL_HANDOFF_SCOPE:END -->
 
 ## 1. Environment
 

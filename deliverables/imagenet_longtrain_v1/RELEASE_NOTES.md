@@ -36,7 +36,9 @@
 ## 交付训练协议
 
 - 共同设置：ImageNet-1K、224×224、patch size 8、300 epochs、AdamW、global batch 1024、lr `5e-4`、5-epoch warmup、cosine、AMP、EMA、DeiT augmentation。
-- 主训练：`configs/mergenet_lambda4.yaml`，4 local + 8 latent、lambda=4、window 32；这是 CIFAR-100 工程结果支持的效率优先候选。
+<!-- CIFAR_RESIZE_FINAL_HANDOFF_NOTES:START -->
+- 主训练：`configs/mergenet_lambda4.yaml`，4 local + 8 latent、lambda=4、window 32；这是可直接运行的 exploratory 候选；完整 CIFAR resize 跨尺度性能门禁未通过，不能称为效率赢家或无条件推荐配置。checkpoint generic/fast 后验 30/30 通过。
+<!-- CIFAR_RESIZE_FINAL_HANDOFF_NOTES:END -->
 - 对照训练：`configs/deit_small_p8_baseline.yaml`，DeiT-S/8，同一优化与增强协议。
 - 回退训练：`configs/mergenet_lambda2.yaml`，6+6、lambda=2、window 16；保留更多 token，准确率风险更保守但成本更高。
 

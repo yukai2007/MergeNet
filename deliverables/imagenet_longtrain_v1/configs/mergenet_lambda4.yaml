@@ -1,5 +1,8 @@
-# Recommended ImageNet scale-up candidate, transferred from the CIFAR-100
-# efficiency winner. ImageNet accuracy is not yet established.
+# CIFAR_RESIZE_FINAL_LAMBDA4_CONFIG:START
+# CIFAR primary performance gate: FAIL; checkpoint parity: PASS; release: NO_GO.
+# Runnable exploratory ImageNet candidate; the cross-scale primary performance gate was not passed.
+# Epoch-199 generic/fast checkpoint parity passed 30/30.
+# CIFAR_RESIZE_FINAL_LAMBDA4_CONFIG:END
 # Paths, run name, batch size, accumulation, and resume are launcher-owned.
 dataset: ""
 train_split: train

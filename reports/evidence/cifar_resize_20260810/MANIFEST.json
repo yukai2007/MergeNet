@@ -1,0 +1,32 @@
+{
+  "accuracy": "45/45",
+  "aggregate_generated_at": "2026-08-14T07:19:47+00:00",
+  "builder": {
+    "path": "experiments/cifar_resize_20260810/build_final_report.py",
+    "sha256": "73daa888eadd280d5f3afe73a982a5db2fa2bd06efd2edb351cef6448e49882c"
+  },
+  "canonical_projection_renderer": {
+    "path": "experiments/cifar_resize_20260810/aggregate_results.py",
+    "policy": "JSON is authoritative; CSV and Markdown must be byte-exact locked-renderer projections",
+    "sha256": "43a4013016d14b36e1d13121bb7a84fbd91b25fd36c1d53d16d5cbbd54eccdb4"
+  },
+  "checkpoint_parity": "30/30:PASS",
+  "efficiency_cards": "8/8",
+  "files": {
+    "aggregate_results.csv": {
+      "bytes": 51935,
+      "sha256": "d3950a8ed45e6093e8d98fe9b8eac9069c4304acac02f45c1c91ae21405bc1c5"
+    },
+    "aggregate_results.json": {
+      "bytes": 477865,
+      "sha256": "8b70f5c63c733ff59b70be0f5986f2bb45c5a78adc8bbee8945c80c2e70500ec"
+    },
+    "aggregate_results.md": {
+      "bytes": 13972,
+      "sha256": "6f63f7040037fc1c1aa9ead89a5e699ef7b57b2910247f37d9851971484f425c"
+    }
+  },
+  "final_release_status": "NO_GO",
+  "lambda4_decision": "FAIL",
+  "schema_version": "mergenet.cifar_resize_report_evidence.v1"
+}
