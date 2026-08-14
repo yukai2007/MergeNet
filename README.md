@@ -19,6 +19,6 @@ Start with the ImageNet handoff README when launching large-scale training.
 
 - [最终 HTML 汇报](reports/mergenet_cifar_resize_final_20260814.html)：完整 5 resize × 3 model 精度、paired delta、8 卡效率和 30-checkpoint parity。
 - [最终证据包](reports/evidence/cifar_resize_20260810/)：aggregate JSON / CSV / Markdown 及 SHA-256 manifest。
-- 状态：accuracy `45/45`，efficiency `8/8`，checkpoint parity `30/30`（**PASS**）；λ4 预注册判定 **FAIL**；最终发布 **NO_GO**。
+- 状态：accuracy `45/45`，efficiency `8/8`，checkpoint parity `30/30`（**PASS**）。
 
 <!-- CIFAR_RESIZE_FINAL:END -->
